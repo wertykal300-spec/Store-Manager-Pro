@@ -1,0 +1,818 @@
+CREATE TABLE tenants (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE stores (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    code TEXT NOT NULL,
+    name TEXT NOT NULL,
+    address TEXT,
+    phone TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(tenant_id, code)
+);
+
+CREATE TABLE fiscal_years (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    year INTEGER NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    is_closed INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(tenant_id, year)
+);
+
+CREATE TABLE currencies (
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    decimal_places INTEGER NOT NULL DEFAULT 2,
+    is_base INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE exchange_rates (
+    id TEXT PRIMARY KEY,
+    currency_code TEXT NOT NULL REFERENCES currencies(code) ON DELETE RESTRICT,
+    rate_numerator INTEGER NOT NULL,
+    rate_denominator INTEGER NOT NULL,
+    valid_from TEXT NOT NULL,
+    CHECK(rate_numerator > 0 AND rate_denominator > 0)
+);
+
+CREATE TABLE app_licenses (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    license_key TEXT NOT NULL UNIQUE,
+    licensee_name TEXT NOT NULL,
+    machine_fingerprint TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    grace_period_days INTEGER NOT NULL DEFAULT 14,
+    features_payload_json TEXT NOT NULL,
+    digital_signature TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'GRACE_PERIOD', 'EXPIRED', 'REVOKED'))
+);
+
+CREATE TABLE document_sequences (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    fiscal_year INTEGER NOT NULL,
+    document_type TEXT NOT NULL CHECK(document_type IN ('SALE', 'SALE_RETURN', 'PURCHASE', 'PURCHASE_RECEIPT', 'PURCHASE_RETURN', 'PAYMENT', 'ADJUSTMENT')),
+    last_sequence_number INTEGER NOT NULL DEFAULT 0,
+    prefix TEXT NOT NULL,
+    suffix TEXT,
+    padding INTEGER NOT NULL DEFAULT 6,
+    UNIQUE(tenant_id, store_id, fiscal_year, document_type)
+);
+
+CREATE TABLE idempotency_records (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    device_id TEXT NOT NULL REFERENCES registered_devices(id) ON DELETE RESTRICT,
+    client_request_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PROCESSING' CHECK(status IN ('PROCESSING','COMPLETED','FAILED')),
+    response_code INTEGER,
+    response_payload_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    completed_at TEXT,
+    UNIQUE(tenant_id, device_id, client_request_id),
+    CHECK((status='PROCESSING' AND response_code IS NULL) OR (status IN ('COMPLETED','FAILED') AND response_code IS NOT NULL))
+);
+
+CREATE TABLE backup_history (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    backup_type TEXT NOT NULL CHECK(backup_type IN ('AUTOMATIC', 'MANUAL_EXPORT', 'BEFORE_UPGRADE')),
+    file_path TEXT NOT NULL,
+    file_size_bytes INTEGER NOT NULL,
+    sha256_checksum TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('SUCCESS', 'FAILED', 'VERIFIED')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    restored_at TEXT
+);
+
+CREATE TABLE users (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    username TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    full_name TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(tenant_id, username)
+);
+
+CREATE TABLE roles (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    description TEXT,
+    is_system INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(tenant_id, name)
+);
+
+CREATE TABLE permissions (
+    code TEXT PRIMARY KEY,
+    category TEXT NOT NULL,
+    description TEXT NOT NULL
+);
+
+CREATE TABLE role_permissions (
+    role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    permission_code TEXT NOT NULL REFERENCES permissions(code) ON DELETE CASCADE,
+    PRIMARY KEY(role_id, permission_code)
+);
+
+CREATE TABLE user_roles (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    PRIMARY KEY(user_id, role_id)
+);
+
+CREATE TABLE user_sessions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    ip_address TEXT,
+    device_info TEXT,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE registered_devices (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    device_name TEXT NOT NULL,
+    device_type TEXT NOT NULL CHECK(device_type IN ('ANDROID_POS', 'WINDOWS_WORKSTATION')),
+    public_key TEXT NOT NULL UNIQUE,
+    pairing_status TEXT NOT NULL CHECK(pairing_status IN ('PENDING', 'ACTIVE', 'REVOKED', 'SUSPENDED')),
+    last_seq_num INTEGER NOT NULL DEFAULT 0,
+    last_seen_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE device_pairing_pins (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    pin_hmac TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    attempts_remaining INTEGER NOT NULL DEFAULT 3,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE audit_logs (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    action TEXT NOT NULL,
+    entity_name TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    payload_before TEXT,
+    payload_after TEXT,
+    ip_address TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE categories (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    parent_id TEXT REFERENCES categories(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    code TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE tax_rates (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    rate_bps INTEGER NOT NULL CHECK(rate_bps >= 0 AND rate_bps <= 10000),
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE units_of_measure (
+    id TEXT PRIMARY KEY,
+    dimension TEXT NOT NULL CHECK(dimension IN ('COUNT', 'WEIGHT', 'VOLUME', 'LENGTH', 'AREA')),
+    name_ar TEXT NOT NULL,
+    name_fr TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    is_fractional INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE unit_conversions (
+    id TEXT PRIMARY KEY,
+    from_unit_id TEXT NOT NULL REFERENCES units_of_measure(id) ON DELETE RESTRICT,
+    to_unit_id TEXT NOT NULL REFERENCES units_of_measure(id) ON DELETE RESTRICT,
+    factor_numerator INTEGER NOT NULL CHECK(factor_numerator > 0),
+    factor_denominator INTEGER NOT NULL CHECK(factor_denominator > 0),
+    UNIQUE(from_unit_id, to_unit_id)
+);
+
+CREATE TABLE products (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    category_id TEXT REFERENCES categories(id) ON DELETE SET NULL,
+    base_unit_id TEXT NOT NULL DEFAULT 'UOM_PIECE' REFERENCES units_of_measure(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    code TEXT,
+    barcode TEXT,
+    track_inventory INTEGER NOT NULL DEFAULT 1,
+    has_variants INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE product_variants (
+    id TEXT PRIMARY KEY,
+    product_id TEXT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    sku TEXT NOT NULL UNIQUE,
+    barcode TEXT,
+    variant_name TEXT NOT NULL,
+    attributes_json TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE price_lists (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    currency_code TEXT NOT NULL REFERENCES currencies(code) ON DELETE RESTRICT,
+    is_default INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE price_list_items (
+    id TEXT PRIMARY KEY,
+    price_list_id TEXT NOT NULL REFERENCES price_lists(id) ON DELETE CASCADE,
+    product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    variant_id TEXT REFERENCES product_variants(id) ON DELETE CASCADE,
+    unit_price_ticks INTEGER NOT NULL CHECK(unit_price_ticks >= 0),
+    UNIQUE(price_list_id, product_id, variant_id)
+);
+
+CREATE TABLE customer_groups (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    discount_bps INTEGER NOT NULL DEFAULT 0 CHECK(discount_bps >= 0 AND discount_bps <= 10000)
+);
+
+CREATE TABLE customers (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    group_id TEXT REFERENCES customer_groups(id) ON DELETE SET NULL,
+    name TEXT NOT NULL,
+    phone TEXT,
+    email TEXT,
+    credit_limit_centimes INTEGER NOT NULL DEFAULT 0,
+    current_balance_centimes INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE suppliers (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    contact_name TEXT,
+    phone TEXT,
+    current_balance_centimes INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE party_ledger_entries (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    party_type TEXT NOT NULL CHECK(party_type IN ('CUSTOMER', 'SUPPLIER')),
+    party_id TEXT NOT NULL,
+    source_document_type TEXT NOT NULL CHECK(source_document_type IN ('SALE', 'SALE_RETURN', 'PURCHASE', 'PURCHASE_RETURN', 'PAYMENT', 'ADJUSTMENT')),
+    source_document_id TEXT NOT NULL,
+    debit_centimes INTEGER NOT NULL DEFAULT 0 CHECK(debit_centimes >= 0),
+    credit_centimes INTEGER NOT NULL DEFAULT 0 CHECK(credit_centimes >= 0),
+    running_balance_centimes INTEGER NOT NULL,
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE warehouses (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE stock_items (
+    id TEXT PRIMARY KEY,
+    product_id TEXT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    variant_id TEXT REFERENCES product_variants(id) ON DELETE RESTRICT,
+    UNIQUE(product_id, variant_id)
+);
+
+CREATE TABLE inventory_balances (
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    on_hand_ticks INTEGER NOT NULL DEFAULT 0 CHECK(on_hand_ticks >= 0),
+    reserved_ticks INTEGER NOT NULL DEFAULT 0 CHECK(reserved_ticks >= 0),
+    current_moving_avg_cost INTEGER NOT NULL DEFAULT 0 CHECK(current_moving_avg_cost >= 0),
+    PRIMARY KEY(warehouse_id, stock_item_id),
+    CHECK(on_hand_ticks >= reserved_ticks)
+);
+
+CREATE TABLE inventory_movements (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    movement_type TEXT NOT NULL CHECK(movement_type IN ('PURCHASE_RECEIPT', 'SALE_SHIPMENT', 'SALE_RETURN', 'PURCHASE_RETURN', 'ADJUSTMENT_IN', 'ADJUSTMENT_OUT', 'TRANSFER_IN', 'TRANSFER_OUT')),
+    source_event_id TEXT UNIQUE NOT NULL,
+    reference_line_id TEXT,
+    quantity_ticks INTEGER NOT NULL,
+    unit_cost_ticks INTEGER NOT NULL DEFAULT 0,
+    total_cost_centimes INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE inventory_adjustments (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    adjustment_number TEXT NOT NULL UNIQUE,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('DRAFT', 'POSTED', 'CANCELLED')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE inventory_adjustment_lines (
+    id TEXT PRIMARY KEY,
+    adjustment_id TEXT NOT NULL REFERENCES inventory_adjustments(id) ON DELETE CASCADE,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    system_quantity_ticks INTEGER NOT NULL,
+    actual_quantity_ticks INTEGER NOT NULL,
+    difference_ticks INTEGER NOT NULL,
+    unit_cost_ticks INTEGER NOT NULL
+);
+
+CREATE TABLE inventory_quotas (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    device_id TEXT NOT NULL REFERENCES registered_devices(id) ON DELETE RESTRICT,
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    quota_quantity_ticks INTEGER NOT NULL CHECK(quota_quantity_ticks > 0),
+    consumed_quantity_ticks INTEGER NOT NULL DEFAULT 0 CHECK(consumed_quantity_ticks >= 0),
+    valid_until TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'RECONCILED', 'EXPIRED', 'LOST_DEVICE_EXPOSURE', 'VOIDED_BY_ADMIN')),
+    signed_token TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CHECK(consumed_quantity_ticks <= quota_quantity_ticks)
+);
+
+CREATE TABLE sales (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    customer_id TEXT REFERENCES customers(id) ON DELETE RESTRICT,
+    device_id TEXT NOT NULL REFERENCES registered_devices(id) ON DELETE RESTRICT,
+    invoice_number TEXT UNIQUE,
+    offline_receipt_number TEXT,
+    local_operation_uuid TEXT,
+    device_seq_num INTEGER,
+    device_signature TEXT,
+    request_hash TEXT,
+    batch_id TEXT,
+    subtotal_centimes INTEGER NOT NULL DEFAULT 0 CHECK(subtotal_centimes >= 0),
+    discount_centimes INTEGER NOT NULL DEFAULT 0 CHECK(discount_centimes >= 0),
+    tax_centimes INTEGER NOT NULL DEFAULT 0 CHECK(tax_centimes >= 0),
+    total_amount_centimes INTEGER NOT NULL CHECK(total_amount_centimes >= 0),
+    paid_amount INTEGER NOT NULL DEFAULT 0 CHECK(paid_amount >= 0),
+    remaining_debt INTEGER NOT NULL CHECK(remaining_debt >= 0),
+    status TEXT NOT NULL CHECK(status IN ('DRAFT', 'COMPLETED', 'CANCELLED')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(device_id, local_operation_uuid),
+    CHECK(paid_amount + remaining_debt = total_amount_centimes)
+);
+
+CREATE TABLE sale_items (
+    id TEXT PRIMARY KEY,
+    sale_id TEXT NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    quantity_ticks INTEGER NOT NULL CHECK(quantity_ticks > 0),
+    returned_quantity_ticks INTEGER NOT NULL DEFAULT 0 CHECK(returned_quantity_ticks >= 0),
+    unit_price_ticks INTEGER NOT NULL CHECK(unit_price_ticks >= 0),
+    discount_bps INTEGER NOT NULL DEFAULT 0 CHECK(discount_bps >= 0 AND discount_bps <= 10000),
+    tax_bps INTEGER NOT NULL DEFAULT 0 CHECK(tax_bps >= 0 AND tax_bps <= 10000),
+    line_total_centimes INTEGER NOT NULL CHECK(line_total_centimes >= 0),
+    cost_at_sale_ticks INTEGER NOT NULL DEFAULT 0,
+    CHECK(returned_quantity_ticks <= quantity_ticks)
+);
+
+CREATE TABLE sale_item_quota_deductions (
+    id TEXT PRIMARY KEY,
+    sale_item_id TEXT NOT NULL REFERENCES sale_items(id) ON DELETE CASCADE,
+    quota_id TEXT NOT NULL REFERENCES inventory_quotas(id) ON DELETE RESTRICT,
+    deducted_quantity_ticks INTEGER NOT NULL CHECK(deducted_quantity_ticks > 0),
+    UNIQUE(sale_item_id, quota_id)
+);
+
+CREATE TABLE sale_returns (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    original_sale_id TEXT NOT NULL REFERENCES sales(id) ON DELETE RESTRICT,
+    return_number TEXT UNIQUE NOT NULL,
+    customer_id TEXT REFERENCES customers(id) ON DELETE RESTRICT,
+    shift_id TEXT REFERENCES cash_shifts(id) ON DELETE RESTRICT,
+    total_refund_centimes INTEGER NOT NULL CHECK(total_refund_centimes >= 0),
+    refund_status TEXT NOT NULL CHECK(refund_status IN ('PENDING', 'REFUNDED_CASH', 'CREDITED_TO_ACCOUNT')),
+    status TEXT NOT NULL CHECK(status IN ('DRAFT', 'COMPLETED', 'CANCELLED')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE sale_return_items (
+    id TEXT PRIMARY KEY,
+    return_id TEXT NOT NULL REFERENCES sale_returns(id) ON DELETE CASCADE,
+    original_sale_item_id TEXT NOT NULL REFERENCES sale_items(id) ON DELETE RESTRICT,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    returned_quantity_ticks INTEGER NOT NULL CHECK(returned_quantity_ticks > 0),
+    refund_unit_price_ticks INTEGER NOT NULL CHECK(refund_unit_price_ticks >= 0),
+    line_total_centimes INTEGER NOT NULL CHECK(line_total_centimes >= 0)
+);
+
+CREATE TABLE purchases (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    supplier_id TEXT NOT NULL REFERENCES suppliers(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    order_number TEXT UNIQUE NOT NULL,
+    total_amount_centimes INTEGER NOT NULL CHECK(total_amount_centimes >= 0),
+    paid_amount INTEGER NOT NULL DEFAULT 0 CHECK(paid_amount >= 0),
+    remaining_debt INTEGER NOT NULL CHECK(remaining_debt >= 0),
+    fulfillment_status TEXT NOT NULL CHECK(fulfillment_status IN ('PENDING', 'PARTIALLY_RECEIVED', 'FULLY_RECEIVED')),
+    status TEXT NOT NULL CHECK(status IN ('DRAFT', 'ORDERED', 'RECEIVED', 'CANCELLED')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CHECK(paid_amount + remaining_debt = total_amount_centimes)
+);
+
+CREATE TABLE purchase_items (
+    id TEXT PRIMARY KEY,
+    purchase_id TEXT NOT NULL REFERENCES purchases(id) ON DELETE CASCADE,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    quantity_ordered_ticks INTEGER NOT NULL CHECK(quantity_ordered_ticks > 0),
+    quantity_received_ticks INTEGER NOT NULL DEFAULT 0 CHECK(quantity_received_ticks >= 0),
+    quantity_returned_ticks INTEGER NOT NULL DEFAULT 0 CHECK(quantity_returned_ticks >= 0),
+    unit_cost_ticks INTEGER NOT NULL CHECK(unit_cost_ticks >= 0),
+    line_total_centimes INTEGER NOT NULL CHECK(line_total_centimes >= 0),
+    CHECK(quantity_received_ticks <= quantity_ordered_ticks),
+    CHECK(quantity_returned_ticks <= quantity_received_ticks)
+);
+
+CREATE TABLE purchase_receipts (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    purchase_id TEXT NOT NULL REFERENCES purchases(id) ON DELETE RESTRICT,
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    receipt_number TEXT UNIQUE NOT NULL,
+    received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    status TEXT NOT NULL CHECK(status IN ('DRAFT', 'COMPLETED', 'CANCELLED'))
+);
+
+CREATE TABLE purchase_receipt_items (
+    id TEXT PRIMARY KEY,
+    receipt_id TEXT NOT NULL REFERENCES purchase_receipts(id) ON DELETE CASCADE,
+    purchase_item_id TEXT NOT NULL REFERENCES purchase_items(id) ON DELETE RESTRICT,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    quantity_received_ticks INTEGER NOT NULL CHECK(quantity_received_ticks > 0),
+    unit_cost_ticks INTEGER NOT NULL CHECK(unit_cost_ticks >= 0)
+);
+
+CREATE TABLE purchase_returns (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    purchase_id TEXT NOT NULL REFERENCES purchases(id) ON DELETE RESTRICT,
+    supplier_id TEXT NOT NULL REFERENCES suppliers(id) ON DELETE RESTRICT,
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    return_number TEXT UNIQUE NOT NULL,
+    total_credit_centimes INTEGER NOT NULL CHECK(total_credit_centimes >= 0),
+    status TEXT NOT NULL CHECK(status IN ('DRAFT', 'COMPLETED', 'CANCELLED')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE purchase_return_items (
+    id TEXT PRIMARY KEY,
+    purchase_return_id TEXT NOT NULL REFERENCES purchase_returns(id) ON DELETE CASCADE,
+    purchase_item_id TEXT NOT NULL REFERENCES purchase_items(id) ON DELETE RESTRICT,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    returned_quantity_ticks INTEGER NOT NULL CHECK(returned_quantity_ticks > 0),
+    unit_cost_ticks INTEGER NOT NULL CHECK(unit_cost_ticks >= 0),
+    line_total_centimes INTEGER NOT NULL CHECK(line_total_centimes >= 0)
+);
+
+CREATE TABLE cash_registers (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    code TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(store_id, code)
+);
+
+CREATE TABLE cash_shifts (
+    id TEXT PRIMARY KEY,
+    cash_register_id TEXT NOT NULL REFERENCES cash_registers(id) ON DELETE RESTRICT,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    opened_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    closed_at TEXT,
+    opening_float_centimes INTEGER NOT NULL CHECK(opening_float_centimes >= 0),
+    expected_cash_centimes INTEGER NOT NULL DEFAULT 0,
+    actual_cash_centimes INTEGER,
+    difference_centimes INTEGER,
+    status TEXT NOT NULL CHECK(status IN ('OPEN', 'CLOSED'))
+);
+
+CREATE TABLE cash_movements (
+    id TEXT PRIMARY KEY,
+    shift_id TEXT NOT NULL REFERENCES cash_shifts(id) ON DELETE RESTRICT,
+    movement_type TEXT NOT NULL CHECK(movement_type IN ('FLOAT_ADD','DROP_PAYOUT','PETTY_EXPENSE','MANUAL_IN','MANUAL_OUT','SALE_COLLECTION','CUSTOMER_DEBT_COLLECTION','SUPPLIER_PAYMENT','CUSTOMER_REFUND','SUPPLIER_REFUND')),
+    amount_centimes INTEGER NOT NULL CHECK(amount_centimes > 0),
+    reason TEXT NOT NULL,
+    source_event_id TEXT UNIQUE NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE expense_categories (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE expenses (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    category_id TEXT NOT NULL REFERENCES expense_categories(id) ON DELETE RESTRICT,
+    amount_centimes INTEGER NOT NULL CHECK(amount_centimes > 0),
+    description TEXT NOT NULL,
+    shift_id TEXT REFERENCES cash_shifts(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE payments (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    party_type TEXT NOT NULL CHECK(party_type IN ('CUSTOMER', 'SUPPLIER')),
+    party_id TEXT NOT NULL,
+    payment_method TEXT NOT NULL CHECK(payment_method IN ('CASH', 'BANK_TRANSFER', 'CHECK', 'CARD')),
+    shift_id TEXT REFERENCES cash_shifts(id) ON DELETE SET NULL,
+    amount INTEGER NOT NULL CHECK(amount > 0),
+    payment_date TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    notes TEXT,
+    is_reversal INTEGER NOT NULL DEFAULT 0 CHECK(is_reversal IN (0,1)),
+    reversal_of_id TEXT REFERENCES payments(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL DEFAULT 'DRAFT' CHECK(status IN ('DRAFT','POSTED','CANCELLED')),
+    UNIQUE(reversal_of_id)
+);
+
+CREATE TABLE payment_allocations (
+    id TEXT PRIMARY KEY,
+    payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE RESTRICT,
+    sale_id TEXT REFERENCES sales(id) ON DELETE RESTRICT,
+    purchase_id TEXT REFERENCES purchases(id) ON DELETE RESTRICT,
+    allocated_amount INTEGER NOT NULL CHECK(allocated_amount > 0),
+    allocated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CHECK((sale_id IS NOT NULL AND purchase_id IS NULL) OR (sale_id IS NULL AND purchase_id IS NOT NULL))
+);
+
+CREATE UNIQUE INDEX idx_stock_items_simple_product 
+ON stock_items(product_id) 
+WHERE variant_id IS NULL;
+
+CREATE UNIQUE INDEX idx_one_open_shift_per_register 
+ON cash_shifts(cash_register_id) 
+WHERE status = 'OPEN';
+
+CREATE UNIQUE INDEX ux_one_store_per_tenant ON stores(tenant_id);
+
+CREATE UNIQUE INDEX ux_one_default_warehouse_per_store ON warehouses(store_id) WHERE is_default=1;
+
+CREATE UNIQUE INDEX ux_one_default_price_list_per_tenant ON price_lists(tenant_id) WHERE is_default=1;
+
+CREATE UNIQUE INDEX ux_one_base_currency ON currencies(is_base) WHERE is_base=1;
+
+CREATE UNIQUE INDEX ux_product_barcode ON products(barcode) WHERE barcode IS NOT NULL AND barcode<>'';
+
+CREATE UNIQUE INDEX ux_variant_barcode ON product_variants(barcode) WHERE barcode IS NOT NULL AND barcode<>'';
+
+CREATE UNIQUE INDEX ux_price_list_simple_product ON price_list_items(price_list_id,product_id) WHERE variant_id IS NULL;
+
+CREATE UNIQUE INDEX ux_price_list_variant ON price_list_items(price_list_id,variant_id) WHERE variant_id IS NOT NULL;
+
+CREATE UNIQUE INDEX ux_one_sale_allocation_per_invoice ON payment_allocations(payment_id,sale_id) WHERE sale_id IS NOT NULL;
+
+CREATE UNIQUE INDEX ux_one_purchase_allocation_per_invoice ON payment_allocations(payment_id,purchase_id) WHERE purchase_id IS NOT NULL;
+
+CREATE UNIQUE INDEX ux_ledger_source_event ON party_ledger_entries(tenant_id,party_type,source_document_type,source_document_id);
+
+CREATE INDEX ix_sales_store_date ON sales(store_id,created_at);
+
+CREATE INDEX ix_sales_customer_date ON sales(customer_id,created_at);
+
+CREATE INDEX ix_sale_items_sale ON sale_items(sale_id);
+
+CREATE INDEX ix_sale_items_stock ON sale_items(stock_item_id);
+
+CREATE INDEX ix_purchase_items_purchase ON purchase_items(purchase_id);
+
+CREATE INDEX ix_purchase_items_stock ON purchase_items(stock_item_id);
+
+CREATE INDEX ix_receipt_items_receipt ON purchase_receipt_items(receipt_id);
+
+CREATE INDEX ix_receipt_items_purchase_item ON purchase_receipt_items(purchase_item_id);
+
+CREATE INDEX ix_purchase_return_items_return ON purchase_return_items(purchase_return_id);
+
+CREATE INDEX ix_sale_return_items_return ON sale_return_items(return_id);
+
+CREATE INDEX ix_quotas_device_status ON inventory_quotas(device_id,status,valid_until);
+
+CREATE INDEX ix_quotas_warehouse_stock ON inventory_quotas(warehouse_id,stock_item_id);
+
+CREATE INDEX ix_movements_stock_wh_date ON inventory_movements(warehouse_id,stock_item_id,created_at);
+
+CREATE INDEX ix_cash_movements_shift_date ON cash_movements(shift_id,created_at);
+
+CREATE INDEX ix_payments_party_date ON payments(tenant_id,party_type,party_id,payment_date);
+
+CREATE INDEX ix_ledger_party_date ON party_ledger_entries(tenant_id,party_type,party_id,created_at);
+
+CREATE INDEX ix_idempotency_created ON idempotency_records(created_at);
+
+CREATE INDEX ix_devices_store_status ON registered_devices(store_id,pairing_status);
+
+CREATE INDEX ix_user_roles_role ON user_roles(role_id);
+
+CREATE INDEX ix_sessions_user_expiry ON user_sessions(user_id,expires_at);
+
+CREATE INDEX ix_expenses_store_date ON expenses(store_id,created_at);
+
+CREATE INDEX ix_products_name ON products(tenant_id,name COLLATE NOCASE);
+
+CREATE INDEX ix_customers_name ON customers(tenant_id,name COLLATE NOCASE);
+
+CREATE INDEX ix_suppliers_name ON suppliers(tenant_id,name COLLATE NOCASE);
+
+CREATE INDEX ix_stores_tenant ON stores(tenant_id);
+
+CREATE INDEX ix_fiscal_years_tenant ON fiscal_years(tenant_id);
+
+CREATE INDEX ix_exchange_rates_currency_date ON exchange_rates(currency_code,valid_from);
+
+CREATE INDEX ix_licenses_tenant ON app_licenses(tenant_id);
+
+CREATE INDEX ix_sequences_store_year ON document_sequences(store_id,fiscal_year);
+
+CREATE INDEX ix_backups_tenant_date ON backup_history(tenant_id,created_at);
+
+CREATE INDEX ix_users_tenant ON users(tenant_id);
+
+CREATE INDEX ix_role_permissions_permission ON role_permissions(permission_code);
+
+CREATE INDEX ix_user_roles_user ON user_roles(user_id);
+
+CREATE INDEX ix_devices_tenant_store ON registered_devices(tenant_id,store_id);
+
+CREATE INDEX ix_pairing_pins_tenant_expiry ON device_pairing_pins(tenant_id,expires_at);
+
+CREATE INDEX ix_audit_tenant_created ON audit_logs(tenant_id,created_at);
+
+CREATE INDEX ix_categories_parent ON categories(parent_id);
+
+CREATE INDEX ix_products_category ON products(category_id);
+
+CREATE INDEX ix_variants_product ON product_variants(product_id);
+
+CREATE INDEX ix_price_lists_tenant ON price_lists(tenant_id);
+
+CREATE INDEX ix_price_items_list ON price_list_items(price_list_id);
+
+CREATE INDEX ix_price_items_product ON price_list_items(product_id);
+
+CREATE INDEX ix_price_items_variant ON price_list_items(variant_id);
+
+CREATE INDEX ix_customer_groups_tenant ON customer_groups(tenant_id);
+
+CREATE INDEX ix_customers_group ON customers(group_id);
+
+CREATE INDEX ix_ledger_tenant ON party_ledger_entries(tenant_id);
+
+CREATE INDEX ix_warehouses_tenant_store ON warehouses(tenant_id,store_id);
+
+CREATE INDEX ix_stock_items_product ON stock_items(product_id);
+
+CREATE INDEX ix_stock_items_variant ON stock_items(variant_id);
+
+CREATE INDEX ix_balances_stock ON inventory_balances(stock_item_id);
+
+CREATE INDEX ix_movements_tenant ON inventory_movements(tenant_id);
+
+CREATE INDEX ix_movements_warehouse ON inventory_movements(warehouse_id);
+
+CREATE INDEX ix_movements_stock ON inventory_movements(stock_item_id);
+
+CREATE INDEX ix_adjustments_tenant ON inventory_adjustments(tenant_id);
+
+CREATE INDEX ix_adjustments_warehouse ON inventory_adjustments(warehouse_id);
+
+CREATE INDEX ix_adjustment_lines_adjustment ON inventory_adjustment_lines(adjustment_id);
+
+CREATE INDEX ix_adjustment_lines_stock ON inventory_adjustment_lines(stock_item_id);
+
+CREATE INDEX ix_quotas_tenant ON inventory_quotas(tenant_id);
+
+CREATE INDEX ix_quotas_warehouse ON inventory_quotas(warehouse_id);
+
+CREATE INDEX ix_quotas_stock ON inventory_quotas(stock_item_id);
+
+CREATE INDEX ix_quotas_device ON inventory_quotas(device_id);
+
+CREATE INDEX ix_sales_tenant ON sales(tenant_id);
+
+CREATE INDEX ix_sales_warehouse ON sales(warehouse_id);
+
+CREATE INDEX ix_sales_device ON sales(device_id);
+
+CREATE INDEX ix_sales_customer ON sales(customer_id);
+
+CREATE INDEX ix_quota_deductions_quota ON sale_item_quota_deductions(quota_id);
+
+CREATE INDEX ix_sale_returns_tenant ON sale_returns(tenant_id);
+
+CREATE INDEX ix_sale_returns_sale ON sale_returns(original_sale_id);
+
+CREATE INDEX ix_sale_return_items_sale_item ON sale_return_items(original_sale_item_id);
+
+CREATE INDEX ix_purchases_tenant ON purchases(tenant_id);
+
+CREATE INDEX ix_purchases_supplier ON purchases(supplier_id);
+
+CREATE INDEX ix_purchases_store ON purchases(store_id);
+
+CREATE INDEX ix_receipts_tenant ON purchase_receipts(tenant_id);
+
+CREATE INDEX ix_receipts_purchase ON purchase_receipts(purchase_id);
+
+CREATE INDEX ix_receipts_warehouse ON purchase_receipts(warehouse_id);
+
+CREATE INDEX ix_purchase_returns_purchase ON purchase_returns(purchase_id);
+
+CREATE INDEX ix_purchase_returns_supplier ON purchase_returns(supplier_id);
+
+CREATE INDEX ix_purchase_returns_warehouse ON purchase_returns(warehouse_id);
+
+CREATE INDEX ix_purchase_return_items_item ON purchase_return_items(purchase_item_id);
+
+CREATE INDEX ix_cash_registers_tenant ON cash_registers(tenant_id);
+
+CREATE INDEX ix_cash_registers_store ON cash_registers(store_id);
+
+CREATE INDEX ix_cash_shifts_user ON cash_shifts(user_id);
+
+CREATE INDEX ix_expense_categories_tenant ON expense_categories(tenant_id);
+
+CREATE INDEX ix_expenses_tenant ON expenses(tenant_id);
+
+CREATE INDEX ix_expenses_category ON expenses(category_id);
+
+CREATE INDEX ix_expenses_shift ON expenses(shift_id);
+
+CREATE INDEX ix_payments_tenant ON payments(tenant_id);
+
+CREATE INDEX ix_payments_shift ON payments(shift_id);
+
+CREATE INDEX ix_payments_reversal ON payments(reversal_of_id);
+
+CREATE INDEX ix_allocations_payment ON payment_allocations(payment_id);
+
+CREATE INDEX ix_allocations_sale ON payment_allocations(sale_id);
+
+CREATE INDEX ix_allocations_purchase ON payment_allocations(purchase_id);
+
+CREATE INDEX ix_idempotency_device ON idempotency_records(device_id);
+
+CREATE UNIQUE INDEX ux_adjustment_line_stock ON inventory_adjustment_lines(adjustment_id,stock_item_id);
+

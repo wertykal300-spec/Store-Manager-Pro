@@ -1,0 +1,1725 @@
+-- ====================================================================
+-- Store Manager Pro: Canonical Database Schema DDL (55 Tables)
+-- Engine: SQLite 3.40.1+ / SQLDelight
+-- Master Fresh Production Baseline v1.0
+-- ====================================================================
+
+PRAGMA foreign_keys = ON;
+PRAGMA user_version = 1;
+
+-- --------------------------------------------------------------------
+-- 1. Core Tenants, Stores, Currencies & System Configuration
+-- --------------------------------------------------------------------
+CREATE TABLE tenants (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE stores (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    code TEXT NOT NULL,
+    name TEXT NOT NULL,
+    address TEXT,
+    phone TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(tenant_id, code)
+);
+
+CREATE TABLE fiscal_years (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    year INTEGER NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    is_closed INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(tenant_id, year)
+);
+
+CREATE TABLE currencies (
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    decimal_places INTEGER NOT NULL DEFAULT 2,
+    is_base INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE exchange_rates (
+    id TEXT PRIMARY KEY,
+    currency_code TEXT NOT NULL REFERENCES currencies(code) ON DELETE RESTRICT,
+    rate_numerator INTEGER NOT NULL,
+    rate_denominator INTEGER NOT NULL,
+    valid_from TEXT NOT NULL,
+    CHECK(rate_numerator > 0 AND rate_denominator > 0)
+);
+
+CREATE TABLE app_licenses (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    license_key TEXT NOT NULL UNIQUE,
+    licensee_name TEXT NOT NULL,
+    machine_fingerprint TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    grace_period_days INTEGER NOT NULL DEFAULT 14,
+    features_payload_json TEXT NOT NULL,
+    digital_signature TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'GRACE_PERIOD', 'EXPIRED', 'REVOKED'))
+);
+
+CREATE TABLE document_sequences (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    fiscal_year INTEGER NOT NULL,
+    document_type TEXT NOT NULL CHECK(document_type IN ('SALE', 'SALE_RETURN', 'PURCHASE', 'PURCHASE_RECEIPT', 'PURCHASE_RETURN', 'PAYMENT', 'ADJUSTMENT')),
+    last_sequence_number INTEGER NOT NULL DEFAULT 0,
+    prefix TEXT NOT NULL,
+    suffix TEXT,
+    padding INTEGER NOT NULL DEFAULT 6,
+    UNIQUE(tenant_id, store_id, fiscal_year, document_type)
+);
+
+CREATE TABLE idempotency_records (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    device_id TEXT NOT NULL REFERENCES registered_devices(id) ON DELETE RESTRICT,
+    client_request_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PROCESSING' CHECK(status IN ('PROCESSING','COMPLETED','FAILED')),
+    response_code INTEGER,
+    response_payload_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    completed_at TEXT,
+    UNIQUE(tenant_id, device_id, client_request_id),
+    CHECK((status='PROCESSING' AND response_code IS NULL) OR (status IN ('COMPLETED','FAILED') AND response_code IS NOT NULL))
+);
+
+CREATE TABLE backup_history (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    backup_type TEXT NOT NULL CHECK(backup_type IN ('AUTOMATIC', 'MANUAL_EXPORT', 'BEFORE_UPGRADE')),
+    file_path TEXT NOT NULL,
+    file_size_bytes INTEGER NOT NULL,
+    sha256_checksum TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('SUCCESS', 'FAILED', 'VERIFIED')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    restored_at TEXT
+);
+
+-- --------------------------------------------------------------------
+-- 2. Identity, Access Control & Devices
+-- --------------------------------------------------------------------
+CREATE TABLE users (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    username TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    full_name TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(tenant_id, username)
+);
+
+CREATE TABLE roles (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    description TEXT,
+    is_system INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(tenant_id, name)
+);
+
+CREATE TABLE permissions (
+    code TEXT PRIMARY KEY,
+    category TEXT NOT NULL,
+    description TEXT NOT NULL
+);
+
+CREATE TABLE role_permissions (
+    role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    permission_code TEXT NOT NULL REFERENCES permissions(code) ON DELETE CASCADE,
+    PRIMARY KEY(role_id, permission_code)
+);
+
+CREATE TABLE user_roles (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    PRIMARY KEY(user_id, role_id)
+);
+
+CREATE TABLE user_sessions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    ip_address TEXT,
+    device_info TEXT,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE registered_devices (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    device_name TEXT NOT NULL,
+    device_type TEXT NOT NULL CHECK(device_type IN ('ANDROID_POS', 'WINDOWS_WORKSTATION')),
+    public_key TEXT NOT NULL UNIQUE,
+    pairing_status TEXT NOT NULL CHECK(pairing_status IN ('PENDING', 'ACTIVE', 'REVOKED', 'SUSPENDED')),
+    last_seq_num INTEGER NOT NULL DEFAULT 0,
+    last_seen_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE device_pairing_pins (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    pin_hmac TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    attempts_remaining INTEGER NOT NULL DEFAULT 3,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE audit_logs (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    action TEXT NOT NULL,
+    entity_name TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    payload_before TEXT,
+    payload_after TEXT,
+    ip_address TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- --------------------------------------------------------------------
+-- 3. Product Catalog, Variants, Units & Pricing
+-- --------------------------------------------------------------------
+CREATE TABLE categories (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    parent_id TEXT REFERENCES categories(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    code TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE tax_rates (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    rate_bps INTEGER NOT NULL CHECK(rate_bps >= 0 AND rate_bps <= 10000),
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE units_of_measure (
+    id TEXT PRIMARY KEY,
+    dimension TEXT NOT NULL CHECK(dimension IN ('COUNT', 'WEIGHT', 'VOLUME', 'LENGTH', 'AREA')),
+    name_ar TEXT NOT NULL,
+    name_fr TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    is_fractional INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE unit_conversions (
+    id TEXT PRIMARY KEY,
+    from_unit_id TEXT NOT NULL REFERENCES units_of_measure(id) ON DELETE RESTRICT,
+    to_unit_id TEXT NOT NULL REFERENCES units_of_measure(id) ON DELETE RESTRICT,
+    factor_numerator INTEGER NOT NULL CHECK(factor_numerator > 0),
+    factor_denominator INTEGER NOT NULL CHECK(factor_denominator > 0),
+    UNIQUE(from_unit_id, to_unit_id)
+);
+
+CREATE TABLE products (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    category_id TEXT REFERENCES categories(id) ON DELETE SET NULL,
+    base_unit_id TEXT NOT NULL DEFAULT 'UOM_PIECE' REFERENCES units_of_measure(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    code TEXT,
+    barcode TEXT,
+    track_inventory INTEGER NOT NULL DEFAULT 1,
+    has_variants INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE product_variants (
+    id TEXT PRIMARY KEY,
+    product_id TEXT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    sku TEXT NOT NULL UNIQUE,
+    barcode TEXT,
+    variant_name TEXT NOT NULL,
+    attributes_json TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE price_lists (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    currency_code TEXT NOT NULL REFERENCES currencies(code) ON DELETE RESTRICT,
+    is_default INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE price_list_items (
+    id TEXT PRIMARY KEY,
+    price_list_id TEXT NOT NULL REFERENCES price_lists(id) ON DELETE CASCADE,
+    product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    variant_id TEXT REFERENCES product_variants(id) ON DELETE CASCADE,
+    unit_price_ticks INTEGER NOT NULL CHECK(unit_price_ticks >= 0),
+    UNIQUE(price_list_id, product_id, variant_id)
+);
+
+-- --------------------------------------------------------------------
+-- 4. Parties & Party Ledger
+-- --------------------------------------------------------------------
+CREATE TABLE customer_groups (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    discount_bps INTEGER NOT NULL DEFAULT 0 CHECK(discount_bps >= 0 AND discount_bps <= 10000)
+);
+
+CREATE TABLE customers (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    group_id TEXT REFERENCES customer_groups(id) ON DELETE SET NULL,
+    name TEXT NOT NULL,
+    phone TEXT,
+    email TEXT,
+    credit_limit_centimes INTEGER NOT NULL DEFAULT 0,
+    current_balance_centimes INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE suppliers (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    contact_name TEXT,
+    phone TEXT,
+    current_balance_centimes INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE party_ledger_entries (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    party_type TEXT NOT NULL CHECK(party_type IN ('CUSTOMER', 'SUPPLIER')),
+    party_id TEXT NOT NULL,
+    source_document_type TEXT NOT NULL CHECK(source_document_type IN ('SALE', 'SALE_RETURN', 'PURCHASE', 'PURCHASE_RETURN', 'PAYMENT', 'ADJUSTMENT')),
+    source_document_id TEXT NOT NULL,
+    debit_centimes INTEGER NOT NULL DEFAULT 0 CHECK(debit_centimes >= 0),
+    credit_centimes INTEGER NOT NULL DEFAULT 0 CHECK(credit_centimes >= 0),
+    running_balance_centimes INTEGER NOT NULL,
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- --------------------------------------------------------------------
+-- 5. Warehouses, Stock Items, Movements, Adjustments & Quotas
+-- --------------------------------------------------------------------
+CREATE TABLE warehouses (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE stock_items (
+    id TEXT PRIMARY KEY,
+    product_id TEXT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    variant_id TEXT REFERENCES product_variants(id) ON DELETE RESTRICT,
+    UNIQUE(product_id, variant_id)
+);
+
+CREATE UNIQUE INDEX idx_stock_items_simple_product 
+ON stock_items(product_id) 
+WHERE variant_id IS NULL;
+
+CREATE TABLE inventory_balances (
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    on_hand_ticks INTEGER NOT NULL DEFAULT 0 CHECK(on_hand_ticks >= 0),
+    reserved_ticks INTEGER NOT NULL DEFAULT 0 CHECK(reserved_ticks >= 0),
+    current_moving_avg_cost INTEGER NOT NULL DEFAULT 0 CHECK(current_moving_avg_cost >= 0),
+    PRIMARY KEY(warehouse_id, stock_item_id),
+    CHECK(on_hand_ticks >= reserved_ticks)
+);
+
+CREATE TABLE inventory_movements (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    movement_type TEXT NOT NULL CHECK(movement_type IN ('PURCHASE_RECEIPT', 'SALE_SHIPMENT', 'SALE_RETURN', 'PURCHASE_RETURN', 'ADJUSTMENT_IN', 'ADJUSTMENT_OUT', 'TRANSFER_IN', 'TRANSFER_OUT')),
+    source_event_id TEXT UNIQUE NOT NULL,
+    reference_line_id TEXT,
+    quantity_ticks INTEGER NOT NULL,
+    unit_cost_ticks INTEGER NOT NULL DEFAULT 0,
+    total_cost_centimes INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE inventory_adjustments (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    adjustment_number TEXT NOT NULL UNIQUE,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('DRAFT', 'POSTED', 'CANCELLED')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE inventory_adjustment_lines (
+    id TEXT PRIMARY KEY,
+    adjustment_id TEXT NOT NULL REFERENCES inventory_adjustments(id) ON DELETE CASCADE,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    system_quantity_ticks INTEGER NOT NULL,
+    actual_quantity_ticks INTEGER NOT NULL,
+    difference_ticks INTEGER NOT NULL,
+    unit_cost_ticks INTEGER NOT NULL
+);
+
+CREATE TABLE inventory_quotas (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    device_id TEXT NOT NULL REFERENCES registered_devices(id) ON DELETE RESTRICT,
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    quota_quantity_ticks INTEGER NOT NULL CHECK(quota_quantity_ticks > 0),
+    consumed_quantity_ticks INTEGER NOT NULL DEFAULT 0 CHECK(consumed_quantity_ticks >= 0),
+    valid_until TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'RECONCILED', 'EXPIRED', 'LOST_DEVICE_EXPOSURE', 'VOIDED_BY_ADMIN')),
+    signed_token TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CHECK(consumed_quantity_ticks <= quota_quantity_ticks)
+);
+
+-- --------------------------------------------------------------------
+-- 6. Sales, Items, Quota Link & Returns
+-- --------------------------------------------------------------------
+CREATE TABLE sales (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    customer_id TEXT REFERENCES customers(id) ON DELETE RESTRICT,
+    device_id TEXT NOT NULL REFERENCES registered_devices(id) ON DELETE RESTRICT,
+    invoice_number TEXT UNIQUE,
+    offline_receipt_number TEXT,
+    local_operation_uuid TEXT,
+    device_seq_num INTEGER,
+    device_signature TEXT,
+    request_hash TEXT,
+    batch_id TEXT,
+    subtotal_centimes INTEGER NOT NULL DEFAULT 0 CHECK(subtotal_centimes >= 0),
+    discount_centimes INTEGER NOT NULL DEFAULT 0 CHECK(discount_centimes >= 0),
+    tax_centimes INTEGER NOT NULL DEFAULT 0 CHECK(tax_centimes >= 0),
+    total_amount_centimes INTEGER NOT NULL CHECK(total_amount_centimes >= 0),
+    paid_amount INTEGER NOT NULL DEFAULT 0 CHECK(paid_amount >= 0),
+    remaining_debt INTEGER NOT NULL CHECK(remaining_debt >= 0),
+    status TEXT NOT NULL CHECK(status IN ('DRAFT', 'COMPLETED', 'CANCELLED')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(device_id, local_operation_uuid),
+    CHECK(paid_amount + remaining_debt = total_amount_centimes)
+);
+
+CREATE TABLE sale_items (
+    id TEXT PRIMARY KEY,
+    sale_id TEXT NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    quantity_ticks INTEGER NOT NULL CHECK(quantity_ticks > 0),
+    returned_quantity_ticks INTEGER NOT NULL DEFAULT 0 CHECK(returned_quantity_ticks >= 0),
+    unit_price_ticks INTEGER NOT NULL CHECK(unit_price_ticks >= 0),
+    discount_bps INTEGER NOT NULL DEFAULT 0 CHECK(discount_bps >= 0 AND discount_bps <= 10000),
+    tax_bps INTEGER NOT NULL DEFAULT 0 CHECK(tax_bps >= 0 AND tax_bps <= 10000),
+    line_total_centimes INTEGER NOT NULL CHECK(line_total_centimes >= 0),
+    cost_at_sale_ticks INTEGER NOT NULL DEFAULT 0,
+    CHECK(returned_quantity_ticks <= quantity_ticks)
+);
+
+CREATE TABLE sale_item_quota_deductions (
+    id TEXT PRIMARY KEY,
+    sale_item_id TEXT NOT NULL REFERENCES sale_items(id) ON DELETE CASCADE,
+    quota_id TEXT NOT NULL REFERENCES inventory_quotas(id) ON DELETE RESTRICT,
+    deducted_quantity_ticks INTEGER NOT NULL CHECK(deducted_quantity_ticks > 0),
+    UNIQUE(sale_item_id, quota_id)
+);
+
+CREATE TABLE sale_returns (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    original_sale_id TEXT NOT NULL REFERENCES sales(id) ON DELETE RESTRICT,
+    return_number TEXT UNIQUE NOT NULL,
+    customer_id TEXT REFERENCES customers(id) ON DELETE RESTRICT,
+    shift_id TEXT REFERENCES cash_shifts(id) ON DELETE RESTRICT,
+    total_refund_centimes INTEGER NOT NULL CHECK(total_refund_centimes >= 0),
+    refund_status TEXT NOT NULL CHECK(refund_status IN ('PENDING', 'REFUNDED_CASH', 'CREDITED_TO_ACCOUNT')),
+    status TEXT NOT NULL CHECK(status IN ('DRAFT', 'COMPLETED', 'CANCELLED')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE sale_return_items (
+    id TEXT PRIMARY KEY,
+    return_id TEXT NOT NULL REFERENCES sale_returns(id) ON DELETE CASCADE,
+    original_sale_item_id TEXT NOT NULL REFERENCES sale_items(id) ON DELETE RESTRICT,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    returned_quantity_ticks INTEGER NOT NULL CHECK(returned_quantity_ticks > 0),
+    refund_unit_price_ticks INTEGER NOT NULL CHECK(refund_unit_price_ticks >= 0),
+    line_total_centimes INTEGER NOT NULL CHECK(line_total_centimes >= 0)
+);
+
+-- --------------------------------------------------------------------
+-- 7. Purchases, Partial Receipts & Supplier Returns
+-- --------------------------------------------------------------------
+CREATE TABLE purchases (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    supplier_id TEXT NOT NULL REFERENCES suppliers(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    order_number TEXT UNIQUE NOT NULL,
+    total_amount_centimes INTEGER NOT NULL CHECK(total_amount_centimes >= 0),
+    paid_amount INTEGER NOT NULL DEFAULT 0 CHECK(paid_amount >= 0),
+    remaining_debt INTEGER NOT NULL CHECK(remaining_debt >= 0),
+    fulfillment_status TEXT NOT NULL CHECK(fulfillment_status IN ('PENDING', 'PARTIALLY_RECEIVED', 'FULLY_RECEIVED')),
+    status TEXT NOT NULL CHECK(status IN ('DRAFT', 'ORDERED', 'RECEIVED', 'CANCELLED')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CHECK(paid_amount + remaining_debt = total_amount_centimes)
+);
+
+CREATE TABLE purchase_items (
+    id TEXT PRIMARY KEY,
+    purchase_id TEXT NOT NULL REFERENCES purchases(id) ON DELETE CASCADE,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    quantity_ordered_ticks INTEGER NOT NULL CHECK(quantity_ordered_ticks > 0),
+    quantity_received_ticks INTEGER NOT NULL DEFAULT 0 CHECK(quantity_received_ticks >= 0),
+    quantity_returned_ticks INTEGER NOT NULL DEFAULT 0 CHECK(quantity_returned_ticks >= 0),
+    unit_cost_ticks INTEGER NOT NULL CHECK(unit_cost_ticks >= 0),
+    line_total_centimes INTEGER NOT NULL CHECK(line_total_centimes >= 0),
+    CHECK(quantity_received_ticks <= quantity_ordered_ticks),
+    CHECK(quantity_returned_ticks <= quantity_received_ticks)
+);
+
+CREATE TABLE purchase_receipts (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    purchase_id TEXT NOT NULL REFERENCES purchases(id) ON DELETE RESTRICT,
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    receipt_number TEXT UNIQUE NOT NULL,
+    received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    status TEXT NOT NULL CHECK(status IN ('DRAFT', 'COMPLETED', 'CANCELLED'))
+);
+
+CREATE TABLE purchase_receipt_items (
+    id TEXT PRIMARY KEY,
+    receipt_id TEXT NOT NULL REFERENCES purchase_receipts(id) ON DELETE CASCADE,
+    purchase_item_id TEXT NOT NULL REFERENCES purchase_items(id) ON DELETE RESTRICT,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    quantity_received_ticks INTEGER NOT NULL CHECK(quantity_received_ticks > 0),
+    unit_cost_ticks INTEGER NOT NULL CHECK(unit_cost_ticks >= 0)
+);
+
+CREATE TABLE purchase_returns (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    purchase_id TEXT NOT NULL REFERENCES purchases(id) ON DELETE RESTRICT,
+    supplier_id TEXT NOT NULL REFERENCES suppliers(id) ON DELETE RESTRICT,
+    warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+    return_number TEXT UNIQUE NOT NULL,
+    total_credit_centimes INTEGER NOT NULL CHECK(total_credit_centimes >= 0),
+    status TEXT NOT NULL CHECK(status IN ('DRAFT', 'COMPLETED', 'CANCELLED')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE purchase_return_items (
+    id TEXT PRIMARY KEY,
+    purchase_return_id TEXT NOT NULL REFERENCES purchase_returns(id) ON DELETE CASCADE,
+    purchase_item_id TEXT NOT NULL REFERENCES purchase_items(id) ON DELETE RESTRICT,
+    stock_item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+    returned_quantity_ticks INTEGER NOT NULL CHECK(returned_quantity_ticks > 0),
+    unit_cost_ticks INTEGER NOT NULL CHECK(unit_cost_ticks >= 0),
+    line_total_centimes INTEGER NOT NULL CHECK(line_total_centimes >= 0)
+);
+
+-- --------------------------------------------------------------------
+-- 8. Cash Registers, Shifts, Cash Movements & Expenses
+-- --------------------------------------------------------------------
+CREATE TABLE cash_registers (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    code TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(store_id, code)
+);
+
+CREATE TABLE cash_shifts (
+    id TEXT PRIMARY KEY,
+    cash_register_id TEXT NOT NULL REFERENCES cash_registers(id) ON DELETE RESTRICT,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    opened_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    closed_at TEXT,
+    opening_float_centimes INTEGER NOT NULL CHECK(opening_float_centimes >= 0),
+    expected_cash_centimes INTEGER NOT NULL DEFAULT 0,
+    actual_cash_centimes INTEGER,
+    difference_centimes INTEGER,
+    status TEXT NOT NULL CHECK(status IN ('OPEN', 'CLOSED'))
+);
+
+CREATE UNIQUE INDEX idx_one_open_shift_per_register 
+ON cash_shifts(cash_register_id) 
+WHERE status = 'OPEN';
+
+CREATE TABLE cash_movements (
+    id TEXT PRIMARY KEY,
+    shift_id TEXT NOT NULL REFERENCES cash_shifts(id) ON DELETE RESTRICT,
+    movement_type TEXT NOT NULL CHECK(movement_type IN ('FLOAT_ADD','DROP_PAYOUT','PETTY_EXPENSE','MANUAL_IN','MANUAL_OUT','SALE_COLLECTION','CUSTOMER_DEBT_COLLECTION','SUPPLIER_PAYMENT','CUSTOMER_REFUND','SUPPLIER_REFUND')),
+    amount_centimes INTEGER NOT NULL CHECK(amount_centimes > 0),
+    reason TEXT NOT NULL,
+    source_event_id TEXT UNIQUE NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE expense_categories (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE expenses (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    category_id TEXT NOT NULL REFERENCES expense_categories(id) ON DELETE RESTRICT,
+    amount_centimes INTEGER NOT NULL CHECK(amount_centimes > 0),
+    description TEXT NOT NULL,
+    shift_id TEXT REFERENCES cash_shifts(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- --------------------------------------------------------------------
+-- 9. Payments, Allocations & Debt Reconciliation
+-- --------------------------------------------------------------------
+CREATE TABLE payments (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+    party_type TEXT NOT NULL CHECK(party_type IN ('CUSTOMER', 'SUPPLIER')),
+    party_id TEXT NOT NULL,
+    payment_method TEXT NOT NULL CHECK(payment_method IN ('CASH', 'BANK_TRANSFER', 'CHECK', 'CARD')),
+    shift_id TEXT REFERENCES cash_shifts(id) ON DELETE SET NULL,
+    amount INTEGER NOT NULL CHECK(amount > 0),
+    payment_date TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    notes TEXT,
+    is_reversal INTEGER NOT NULL DEFAULT 0 CHECK(is_reversal IN (0,1)),
+    reversal_of_id TEXT REFERENCES payments(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL DEFAULT 'DRAFT' CHECK(status IN ('DRAFT','POSTED','CANCELLED')),
+    UNIQUE(reversal_of_id)
+);
+
+CREATE TABLE payment_allocations (
+    id TEXT PRIMARY KEY,
+    payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE RESTRICT,
+    sale_id TEXT REFERENCES sales(id) ON DELETE RESTRICT,
+    purchase_id TEXT REFERENCES purchases(id) ON DELETE RESTRICT,
+    allocated_amount INTEGER NOT NULL CHECK(allocated_amount > 0),
+    allocated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CHECK((sale_id IS NOT NULL AND purchase_id IS NULL) OR (sale_id IS NULL AND purchase_id IS NOT NULL))
+);
+
+-- --------------------------------------------------------------------
+-- 10. Triggers: Financial, Physical, Operational & Security Invariants
+-- --------------------------------------------------------------------
+
+-- Audit Logs Immutability
+CREATE TRIGGER trg_audit_logs_no_update
+BEFORE UPDATE ON audit_logs
+BEGIN
+    SELECT RAISE(ABORT, 'AUDIT_LOGS_ARE_IMMUTABLE');
+END;
+
+CREATE TRIGGER trg_audit_logs_no_delete
+BEFORE DELETE ON audit_logs
+BEGIN
+    SELECT RAISE(ABORT, 'AUDIT_LOGS_ARE_IMMUTABLE');
+END;
+
+-- Document Deletion Protection
+CREATE TRIGGER trg_sales_prevent_delete_completed
+BEFORE DELETE ON sales
+WHEN OLD.status != 'DRAFT'
+BEGIN
+    SELECT RAISE(ABORT, 'CANNOT_DELETE_APPROVED_OR_COMPLETED_SALE');
+END;
+
+CREATE TRIGGER trg_purchases_prevent_delete_completed
+BEFORE DELETE ON purchases
+WHEN OLD.status != 'DRAFT'
+BEGIN
+    SELECT RAISE(ABORT, 'CANNOT_DELETE_APPROVED_OR_COMPLETED_PURCHASE');
+END;
+
+CREATE TRIGGER trg_inventory_movements_prevent_delete
+BEFORE DELETE ON inventory_movements
+BEGIN
+    SELECT RAISE(ABORT, 'CANNOT_DELETE_HISTORICAL_INVENTORY_MOVEMENTS');
+END;
+
+-- Unit of Measure Protection
+CREATE TRIGGER trg_protect_seed_uom_delete
+BEFORE DELETE ON units_of_measure
+WHEN OLD.id = 'UOM_PIECE'
+BEGIN
+    SELECT RAISE(ABORT, 'SYSTEM_UNIT_OF_MEASURE_CANNOT_BE_DELETED');
+END;
+
+CREATE TRIGGER trg_uom_prevent_dimension_update_if_used
+BEFORE UPDATE OF dimension ON units_of_measure
+WHEN EXISTS (SELECT 1 FROM products WHERE base_unit_id = OLD.id) 
+  OR EXISTS (SELECT 1 FROM unit_conversions WHERE from_unit_id = OLD.id OR to_unit_id = OLD.id)
+BEGIN
+    SELECT RAISE(ABORT, 'CANNOT_MODIFY_DIMENSION_OF_IN_USE_UNIT_OF_MEASURE');
+END;
+
+CREATE TRIGGER trg_check_unit_conversion_dimension_insert
+BEFORE INSERT ON unit_conversions
+BEGIN
+    SELECT CASE
+        WHEN (SELECT dimension FROM units_of_measure WHERE id = NEW.from_unit_id) !=
+             (SELECT dimension FROM units_of_measure WHERE id = NEW.to_unit_id)
+        THEN RAISE(ABORT, 'CROSS_DIMENSION_CONVERSION_FORBIDDEN')
+        WHEN NEW.from_unit_id = NEW.to_unit_id
+        THEN RAISE(ABORT, 'SELF_UNIT_CONVERSION_FORBIDDEN')
+        WHEN EXISTS (
+            SELECT 1 FROM unit_conversions 
+            WHERE from_unit_id = NEW.to_unit_id AND to_unit_id = NEW.from_unit_id
+              AND (factor_numerator * NEW.factor_numerator != factor_denominator * NEW.factor_denominator)
+        )
+        THEN RAISE(ABORT, 'CONTRADICTORY_REVERSE_CONVERSION_FORBIDDEN')
+    END;
+END;
+
+CREATE TRIGGER trg_check_unit_conversion_dimension_update
+BEFORE UPDATE OF from_unit_id, to_unit_id, factor_numerator, factor_denominator ON unit_conversions
+BEGIN
+    SELECT CASE
+        WHEN (SELECT dimension FROM units_of_measure WHERE id = NEW.from_unit_id) !=
+             (SELECT dimension FROM units_of_measure WHERE id = NEW.to_unit_id)
+        THEN RAISE(ABORT, 'CROSS_DIMENSION_CONVERSION_FORBIDDEN')
+        WHEN NEW.from_unit_id = NEW.to_unit_id
+        THEN RAISE(ABORT, 'SELF_UNIT_CONVERSION_FORBIDDEN')
+        WHEN EXISTS (
+            SELECT 1 FROM unit_conversions 
+            WHERE from_unit_id = NEW.to_unit_id AND to_unit_id = NEW.from_unit_id
+              AND id != OLD.id
+              AND (factor_numerator * NEW.factor_numerator != factor_denominator * NEW.factor_denominator)
+        )
+        THEN RAISE(ABORT, 'CONTRADICTORY_REVERSE_CONVERSION_FORBIDDEN')
+    END;
+END;
+
+-- StockItem Product-Variant Consistency Guard
+CREATE TRIGGER trg_stock_item_variant_consistency_insert
+BEFORE INSERT ON stock_items
+WHEN NEW.variant_id IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN (SELECT product_id FROM product_variants WHERE id = NEW.variant_id) != NEW.product_id
+        THEN RAISE(ABORT, 'VARIANT_DOES_NOT_BELONG_TO_SPECIFIED_PRODUCT')
+    END;
+END;
+
+CREATE TRIGGER trg_stock_item_variant_consistency_update
+BEFORE UPDATE OF product_id, variant_id ON stock_items
+WHEN NEW.variant_id IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN (SELECT product_id FROM product_variants WHERE id = NEW.variant_id) != NEW.product_id
+        THEN RAISE(ABORT, 'VARIANT_DOES_NOT_BELONG_TO_SPECIFIED_PRODUCT')
+    END;
+END;
+
+-- Tenant & Store Alignment Trigger on Sales
+CREATE TRIGGER trg_sales_store_warehouse_alignment
+BEFORE INSERT ON sales
+BEGIN
+    SELECT CASE
+        WHEN (SELECT store_id FROM warehouses WHERE id = NEW.warehouse_id) != NEW.store_id
+        THEN RAISE(ABORT, 'WAREHOUSE_DOES_NOT_BELONG_TO_SALE_STORE')
+        WHEN (SELECT tenant_id FROM stores WHERE id = NEW.store_id) != NEW.tenant_id
+        THEN RAISE(ABORT, 'STORE_DOES_NOT_BELONG_TO_SALE_TENANT')
+    END;
+END;
+
+-- Offline Quotas: Safe Consumption Guard
+CREATE TRIGGER trg_sale_item_quota_deduction_guard
+BEFORE INSERT ON sale_item_quota_deductions
+BEGIN
+    SELECT CASE
+        WHEN (SELECT stock_item_id FROM inventory_quotas WHERE id = NEW.quota_id) !=
+             (SELECT stock_item_id FROM sale_items WHERE id = NEW.sale_item_id)
+        THEN RAISE(ABORT, 'QUOTA_STOCK_ITEM_MISMATCH')
+        WHEN (SELECT device_id FROM inventory_quotas WHERE id = NEW.quota_id) !=
+             (SELECT s.device_id FROM sales s JOIN sale_items si ON si.sale_id = s.id WHERE si.id = NEW.sale_item_id)
+        THEN RAISE(ABORT, 'QUOTA_DEVICE_MISMATCH')
+        WHEN (SELECT status FROM inventory_quotas WHERE id = NEW.quota_id) != 'ACTIVE'
+        THEN RAISE(ABORT, 'QUOTA_IS_NOT_ACTIVE')
+        WHEN (SELECT valid_until FROM inventory_quotas WHERE id = NEW.quota_id) < (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        THEN RAISE(ABORT, 'QUOTA_HAS_EXPIRED')
+        WHEN (SELECT consumed_quantity_ticks + NEW.deducted_quantity_ticks FROM inventory_quotas WHERE id = NEW.quota_id) >
+             (SELECT quota_quantity_ticks FROM inventory_quotas WHERE id = NEW.quota_id)
+        THEN RAISE(ABORT, 'QUOTA_CONSUMPTION_EXCEEDS_REMAINING_BALANCE')
+    END;
+END;
+
+CREATE TRIGGER trg_after_sale_item_quota_deduction_update
+AFTER INSERT ON sale_item_quota_deductions
+BEGIN
+    UPDATE inventory_quotas
+    SET consumed_quantity_ticks = consumed_quantity_ticks + NEW.deducted_quantity_ticks
+    WHERE id = NEW.quota_id;
+END;
+
+-- Payment Allocations: Immutability, Party Matching & Strict Debt Limits
+CREATE TRIGGER trg_payment_allocations_no_update
+BEFORE UPDATE ON payment_allocations
+BEGIN
+    SELECT RAISE(ABORT, 'PAYMENT_ALLOCATIONS_ARE_IMMUTABLE_USE_REVERSAL_RECORD');
+END;
+
+CREATE TRIGGER trg_payment_allocations_no_delete
+BEFORE DELETE ON payment_allocations
+BEGIN
+    SELECT RAISE(ABORT, 'PAYMENT_ALLOCATIONS_ARE_IMMUTABLE_USE_REVERSAL_RECORD');
+END;
+
+CREATE TRIGGER trg_check_allocation_walkin_sale
+BEFORE INSERT ON payment_allocations
+WHEN NEW.sale_id IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN (SELECT customer_id FROM sales WHERE id = NEW.sale_id) IS NULL
+        THEN RAISE(ABORT, 'CANNOT_ALLOCATE_PAYMENT_TO_WALKIN_SALE_WITHOUT_CUSTOMER')
+    END;
+END;
+
+CREATE TRIGGER trg_check_payment_total_allocation_insert
+BEFORE INSERT ON payment_allocations
+BEGIN
+    SELECT CASE
+        WHEN (SELECT is_reversal FROM payments WHERE id = NEW.payment_id) = 0
+         AND (COALESCE((SELECT SUM(allocated_amount) FROM payment_allocations WHERE payment_id = NEW.payment_id), 0) + NEW.allocated_amount) >
+             (SELECT amount FROM payments WHERE id = NEW.payment_id)
+        THEN RAISE(ABORT, 'PAYMENT_ALLOCATION_EXCEEDS_PAYMENT_AMOUNT')
+    END;
+END;
+
+CREATE TRIGGER trg_check_allocation_sale_debt_and_party
+BEFORE INSERT ON payment_allocations
+WHEN NEW.sale_id IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN (SELECT party_type FROM payments WHERE id = NEW.payment_id) != 'CUSTOMER'
+        THEN RAISE(ABORT, 'PAYMENT_PARTY_TYPE_MUST_BE_CUSTOMER_FOR_SALE_ALLOCATION')
+        WHEN (SELECT party_id FROM payments WHERE id = NEW.payment_id) !=
+             (SELECT customer_id FROM sales WHERE id = NEW.sale_id)
+        THEN RAISE(ABORT, 'PAYMENT_PARTY_MISMATCH_SALE_CUSTOMER')
+        WHEN (SELECT is_reversal FROM payments WHERE id = NEW.payment_id) = 0
+         AND NEW.allocated_amount > (SELECT remaining_debt FROM sales WHERE id = NEW.sale_id)
+        THEN RAISE(ABORT, 'ALLOCATION_EXCEEDS_OUTSTANDING_INVOICE_DEBT')
+    END;
+END;
+
+CREATE TRIGGER trg_check_allocation_purchase_debt_and_party
+BEFORE INSERT ON payment_allocations
+WHEN NEW.purchase_id IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN (SELECT party_type FROM payments WHERE id = NEW.payment_id) != 'SUPPLIER'
+        THEN RAISE(ABORT, 'PAYMENT_PARTY_TYPE_MUST_BE_SUPPLIER_FOR_PURCHASE_ALLOCATION')
+        WHEN (SELECT party_id FROM payments WHERE id = NEW.payment_id) !=
+             (SELECT supplier_id FROM purchases WHERE id = NEW.purchase_id)
+        THEN RAISE(ABORT, 'PAYMENT_PARTY_MISMATCH_PURCHASE_SUPPLIER')
+        WHEN (SELECT is_reversal FROM payments WHERE id = NEW.payment_id) = 0
+         AND NEW.allocated_amount > (SELECT remaining_debt FROM purchases WHERE id = NEW.purchase_id)
+        THEN RAISE(ABORT, 'ALLOCATION_EXCEEDS_OUTSTANDING_PURCHASE_DEBT')
+    END;
+END;
+
+CREATE TRIGGER trg_after_allocation_update_sale_balances
+AFTER INSERT ON payment_allocations
+WHEN NEW.sale_id IS NOT NULL
+BEGIN
+    UPDATE sales
+    SET paid_amount = paid_amount + NEW.allocated_amount,
+        remaining_debt = remaining_debt - NEW.allocated_amount
+    WHERE id = NEW.sale_id;
+END;
+
+CREATE TRIGGER trg_after_allocation_update_purchase_balances
+AFTER INSERT ON payment_allocations
+WHEN NEW.purchase_id IS NOT NULL
+BEGIN
+    UPDATE purchases
+    SET paid_amount = paid_amount + NEW.allocated_amount,
+        remaining_debt = remaining_debt - NEW.allocated_amount
+    WHERE id = NEW.purchase_id;
+END;
+
+CREATE TRIGGER trg_prevent_lowering_allocated_payment
+BEFORE UPDATE OF amount ON payments
+BEGIN
+    SELECT CASE
+        WHEN NEW.amount < COALESCE((SELECT SUM(allocated_amount) FROM payment_allocations WHERE payment_id = OLD.id), 0)
+        THEN RAISE(ABORT, 'CANNOT_DOWNGRADE_PAYMENT_BELOW_ALLOCATED_TOTAL')
+    END;
+END;
+
+-- Purchase Receipts: Order Alignment & Over-receipt Prevention
+CREATE TRIGGER trg_purchase_receipt_item_guard
+BEFORE INSERT ON purchase_receipt_items
+BEGIN
+    SELECT CASE
+        WHEN (SELECT purchase_id FROM purchase_items WHERE id = NEW.purchase_item_id) !=
+             (SELECT purchase_id FROM purchase_receipts WHERE id = NEW.receipt_id)
+        THEN RAISE(ABORT, 'RECEIPT_ITEM_PURCHASE_ORDER_MISMATCH')
+        WHEN (SELECT quantity_received_ticks + NEW.quantity_received_ticks FROM purchase_items WHERE id = NEW.purchase_item_id) >
+             (SELECT quantity_ordered_ticks FROM purchase_items WHERE id = NEW.purchase_item_id)
+        THEN RAISE(ABORT, 'RECEIPT_EXCEEDS_ORDERED_QUANTITY')
+    END;
+END;
+
+CREATE TRIGGER trg_purchase_receipt_item_update_order_line
+AFTER INSERT ON purchase_receipt_items
+BEGIN
+    UPDATE purchase_items
+    SET quantity_received_ticks = quantity_received_ticks + NEW.quantity_received_ticks
+    WHERE id = NEW.purchase_item_id;
+END;
+
+-- Purchase Returns: Order Alignment & Over-return Prevention
+CREATE TRIGGER trg_purchase_return_item_guard
+BEFORE INSERT ON purchase_return_items
+BEGIN
+    SELECT CASE
+        WHEN (SELECT purchase_id FROM purchase_items WHERE id = NEW.purchase_item_id) !=
+             (SELECT purchase_id FROM purchase_returns WHERE id = NEW.purchase_return_id)
+        THEN RAISE(ABORT, 'RETURN_ITEM_PURCHASE_ORDER_MISMATCH')
+        WHEN (SELECT quantity_returned_ticks + NEW.returned_quantity_ticks FROM purchase_items WHERE id = NEW.purchase_item_id) >
+             (SELECT quantity_received_ticks FROM purchase_items WHERE id = NEW.purchase_item_id)
+        THEN RAISE(ABORT, 'PURCHASE_RETURN_EXCEEDS_RECEIVED_QUANTITY')
+    END;
+END;
+
+CREATE TRIGGER trg_purchase_return_item_update_order_line
+AFTER INSERT ON purchase_return_items
+BEGIN
+    UPDATE purchase_items
+    SET quantity_returned_ticks = quantity_returned_ticks + NEW.returned_quantity_ticks
+    WHERE id = NEW.purchase_item_id;
+END;
+
+-- Sale Returns: Sale Alignment & Over-return Prevention
+CREATE TRIGGER trg_sale_return_item_guard
+BEFORE INSERT ON sale_return_items
+BEGIN
+    SELECT CASE
+        WHEN (SELECT sale_id FROM sale_items WHERE id = NEW.original_sale_item_id) !=
+             (SELECT original_sale_id FROM sale_returns WHERE id = NEW.return_id)
+        THEN RAISE(ABORT, 'RETURN_ITEM_ORIGINAL_SALE_MISMATCH')
+        WHEN (SELECT returned_quantity_ticks + NEW.returned_quantity_ticks FROM sale_items WHERE id = NEW.original_sale_item_id) >
+             (SELECT quantity_ticks FROM sale_items WHERE id = NEW.original_sale_item_id)
+        THEN RAISE(ABORT, 'SALE_RETURN_EXCEEDS_SOLD_QUANTITY')
+    END;
+END;
+
+CREATE TRIGGER trg_sale_return_item_update_sale_line
+AFTER INSERT ON sale_return_items
+BEGIN
+    UPDATE sale_items
+    SET returned_quantity_ticks = returned_quantity_ticks + NEW.returned_quantity_ticks
+    WHERE id = NEW.original_sale_item_id;
+END;
+-- Additional integrity closure. Run after the canonical DDL in the same transaction.
+
+-- Restrict primary license scope to one store per tenant.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_one_store_per_tenant ON stores(tenant_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_one_default_warehouse_per_store ON warehouses(store_id) WHERE is_default=1;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_one_default_price_list_per_tenant ON price_lists(tenant_id) WHERE is_default=1;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_one_base_currency ON currencies(is_base) WHERE is_base=1;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_product_barcode ON products(barcode) WHERE barcode IS NOT NULL AND barcode<>'';
+CREATE UNIQUE INDEX IF NOT EXISTS ux_variant_barcode ON product_variants(barcode) WHERE barcode IS NOT NULL AND barcode<>'';
+CREATE UNIQUE INDEX IF NOT EXISTS ux_price_list_simple_product ON price_list_items(price_list_id,product_id) WHERE variant_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_price_list_variant ON price_list_items(price_list_id,variant_id) WHERE variant_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_one_sale_allocation_per_invoice ON payment_allocations(payment_id,sale_id) WHERE sale_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_one_purchase_allocation_per_invoice ON payment_allocations(payment_id,purchase_id) WHERE purchase_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ledger_source_event ON party_ledger_entries(tenant_id,party_type,source_document_type,source_document_id);
+
+-- Search / operational indexes.
+CREATE INDEX IF NOT EXISTS ix_sales_store_date ON sales(store_id,created_at);
+CREATE INDEX IF NOT EXISTS ix_sales_customer_date ON sales(customer_id,created_at);
+CREATE INDEX IF NOT EXISTS ix_sale_items_sale ON sale_items(sale_id);
+CREATE INDEX IF NOT EXISTS ix_sale_items_stock ON sale_items(stock_item_id);
+CREATE INDEX IF NOT EXISTS ix_purchase_items_purchase ON purchase_items(purchase_id);
+CREATE INDEX IF NOT EXISTS ix_purchase_items_stock ON purchase_items(stock_item_id);
+CREATE INDEX IF NOT EXISTS ix_receipt_items_receipt ON purchase_receipt_items(receipt_id);
+CREATE INDEX IF NOT EXISTS ix_receipt_items_purchase_item ON purchase_receipt_items(purchase_item_id);
+CREATE INDEX IF NOT EXISTS ix_purchase_return_items_return ON purchase_return_items(purchase_return_id);
+CREATE INDEX IF NOT EXISTS ix_sale_return_items_return ON sale_return_items(return_id);
+CREATE INDEX IF NOT EXISTS ix_quotas_device_status ON inventory_quotas(device_id,status,valid_until);
+CREATE INDEX IF NOT EXISTS ix_quotas_warehouse_stock ON inventory_quotas(warehouse_id,stock_item_id);
+CREATE INDEX IF NOT EXISTS ix_movements_stock_wh_date ON inventory_movements(warehouse_id,stock_item_id,created_at);
+CREATE INDEX IF NOT EXISTS ix_cash_movements_shift_date ON cash_movements(shift_id,created_at);
+CREATE INDEX IF NOT EXISTS ix_payments_party_date ON payments(tenant_id,party_type,party_id,payment_date);
+CREATE INDEX IF NOT EXISTS ix_ledger_party_date ON party_ledger_entries(tenant_id,party_type,party_id,created_at);
+CREATE INDEX IF NOT EXISTS ix_idempotency_created ON idempotency_records(created_at);
+CREATE INDEX IF NOT EXISTS ix_devices_store_status ON registered_devices(store_id,pairing_status);
+CREATE INDEX IF NOT EXISTS ix_user_roles_role ON user_roles(role_id);
+CREATE INDEX IF NOT EXISTS ix_sessions_user_expiry ON user_sessions(user_id,expires_at);
+CREATE INDEX IF NOT EXISTS ix_expenses_store_date ON expenses(store_id,created_at);
+CREATE INDEX IF NOT EXISTS ix_products_name ON products(tenant_id,name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS ix_customers_name ON customers(tenant_id,name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS ix_suppliers_name ON suppliers(tenant_id,name COLLATE NOCASE);
+
+-- Foreign-key lookup indexes.
+CREATE INDEX IF NOT EXISTS ix_stores_tenant ON stores(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_fiscal_years_tenant ON fiscal_years(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_exchange_rates_currency_date ON exchange_rates(currency_code,valid_from);
+CREATE INDEX IF NOT EXISTS ix_licenses_tenant ON app_licenses(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_sequences_store_year ON document_sequences(store_id,fiscal_year);
+CREATE INDEX IF NOT EXISTS ix_backups_tenant_date ON backup_history(tenant_id,created_at);
+CREATE INDEX IF NOT EXISTS ix_users_tenant ON users(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_role_permissions_permission ON role_permissions(permission_code);
+CREATE INDEX IF NOT EXISTS ix_user_roles_user ON user_roles(user_id);
+CREATE INDEX IF NOT EXISTS ix_devices_tenant_store ON registered_devices(tenant_id,store_id);
+CREATE INDEX IF NOT EXISTS ix_pairing_pins_tenant_expiry ON device_pairing_pins(tenant_id,expires_at);
+CREATE INDEX IF NOT EXISTS ix_audit_tenant_created ON audit_logs(tenant_id,created_at);
+CREATE INDEX IF NOT EXISTS ix_categories_parent ON categories(parent_id);
+CREATE INDEX IF NOT EXISTS ix_products_category ON products(category_id);
+CREATE INDEX IF NOT EXISTS ix_variants_product ON product_variants(product_id);
+CREATE INDEX IF NOT EXISTS ix_price_lists_tenant ON price_lists(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_price_items_list ON price_list_items(price_list_id);
+CREATE INDEX IF NOT EXISTS ix_price_items_product ON price_list_items(product_id);
+CREATE INDEX IF NOT EXISTS ix_price_items_variant ON price_list_items(variant_id);
+CREATE INDEX IF NOT EXISTS ix_customer_groups_tenant ON customer_groups(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_customers_group ON customers(group_id);
+CREATE INDEX IF NOT EXISTS ix_ledger_tenant ON party_ledger_entries(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_warehouses_tenant_store ON warehouses(tenant_id,store_id);
+CREATE INDEX IF NOT EXISTS ix_stock_items_product ON stock_items(product_id);
+CREATE INDEX IF NOT EXISTS ix_stock_items_variant ON stock_items(variant_id);
+CREATE INDEX IF NOT EXISTS ix_balances_stock ON inventory_balances(stock_item_id);
+CREATE INDEX IF NOT EXISTS ix_movements_tenant ON inventory_movements(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_movements_warehouse ON inventory_movements(warehouse_id);
+CREATE INDEX IF NOT EXISTS ix_movements_stock ON inventory_movements(stock_item_id);
+CREATE INDEX IF NOT EXISTS ix_adjustments_tenant ON inventory_adjustments(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_adjustments_warehouse ON inventory_adjustments(warehouse_id);
+CREATE INDEX IF NOT EXISTS ix_adjustment_lines_adjustment ON inventory_adjustment_lines(adjustment_id);
+CREATE INDEX IF NOT EXISTS ix_adjustment_lines_stock ON inventory_adjustment_lines(stock_item_id);
+CREATE INDEX IF NOT EXISTS ix_quotas_tenant ON inventory_quotas(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_quotas_warehouse ON inventory_quotas(warehouse_id);
+CREATE INDEX IF NOT EXISTS ix_quotas_stock ON inventory_quotas(stock_item_id);
+CREATE INDEX IF NOT EXISTS ix_quotas_device ON inventory_quotas(device_id);
+CREATE INDEX IF NOT EXISTS ix_sales_tenant ON sales(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_sales_warehouse ON sales(warehouse_id);
+CREATE INDEX IF NOT EXISTS ix_sales_device ON sales(device_id);
+CREATE INDEX IF NOT EXISTS ix_sales_customer ON sales(customer_id);
+CREATE INDEX IF NOT EXISTS ix_quota_deductions_quota ON sale_item_quota_deductions(quota_id);
+CREATE INDEX IF NOT EXISTS ix_sale_returns_tenant ON sale_returns(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_sale_returns_sale ON sale_returns(original_sale_id);
+CREATE INDEX IF NOT EXISTS ix_sale_return_items_sale_item ON sale_return_items(original_sale_item_id);
+CREATE INDEX IF NOT EXISTS ix_purchases_tenant ON purchases(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_purchases_supplier ON purchases(supplier_id);
+CREATE INDEX IF NOT EXISTS ix_purchases_store ON purchases(store_id);
+CREATE INDEX IF NOT EXISTS ix_receipts_tenant ON purchase_receipts(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_receipts_purchase ON purchase_receipts(purchase_id);
+CREATE INDEX IF NOT EXISTS ix_receipts_warehouse ON purchase_receipts(warehouse_id);
+CREATE INDEX IF NOT EXISTS ix_purchase_returns_purchase ON purchase_returns(purchase_id);
+CREATE INDEX IF NOT EXISTS ix_purchase_returns_supplier ON purchase_returns(supplier_id);
+CREATE INDEX IF NOT EXISTS ix_purchase_returns_warehouse ON purchase_returns(warehouse_id);
+CREATE INDEX IF NOT EXISTS ix_purchase_return_items_item ON purchase_return_items(purchase_item_id);
+CREATE INDEX IF NOT EXISTS ix_cash_registers_tenant ON cash_registers(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_cash_registers_store ON cash_registers(store_id);
+CREATE INDEX IF NOT EXISTS ix_cash_shifts_user ON cash_shifts(user_id);
+CREATE INDEX IF NOT EXISTS ix_expense_categories_tenant ON expense_categories(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_expenses_tenant ON expenses(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_expenses_category ON expenses(category_id);
+CREATE INDEX IF NOT EXISTS ix_expenses_shift ON expenses(shift_id);
+CREATE INDEX IF NOT EXISTS ix_payments_tenant ON payments(tenant_id);
+CREATE INDEX IF NOT EXISTS ix_payments_shift ON payments(shift_id);
+CREATE INDEX IF NOT EXISTS ix_payments_reversal ON payments(reversal_of_id);
+CREATE INDEX IF NOT EXISTS ix_allocations_payment ON payment_allocations(payment_id);
+CREATE INDEX IF NOT EXISTS ix_allocations_sale ON payment_allocations(sale_id);
+CREATE INDEX IF NOT EXISTS ix_allocations_purchase ON payment_allocations(purchase_id);
+CREATE INDEX IF NOT EXISTS ix_idempotency_device ON idempotency_records(device_id);
+
+-- Replace incomplete triggers from the source draft.
+DROP TRIGGER IF EXISTS trg_sales_store_warehouse_alignment;
+DROP TRIGGER IF EXISTS trg_after_allocation_update_sale_balances;
+DROP TRIGGER IF EXISTS trg_after_allocation_update_purchase_balances;
+DROP TRIGGER IF EXISTS trg_check_allocation_sale_debt_and_party;
+DROP TRIGGER IF EXISTS trg_check_allocation_purchase_debt_and_party;
+DROP TRIGGER IF EXISTS trg_check_payment_total_allocation_insert;
+DROP TRIGGER IF EXISTS trg_check_allocation_walkin_sale;
+DROP TRIGGER IF EXISTS trg_prevent_lowering_allocated_payment;
+DROP TRIGGER IF EXISTS trg_sale_item_quota_deduction_guard;
+DROP TRIGGER IF EXISTS trg_payment_cash_post;
+DROP TRIGGER IF EXISTS trg_payment_ledger_post;
+DROP TRIGGER IF EXISTS trg_allocation_apply_sale;
+DROP TRIGGER IF EXISTS trg_allocation_apply_purchase;
+DROP TRIGGER IF EXISTS trg_allocation_no_delete;
+DROP TRIGGER IF EXISTS trg_allocation_no_update;
+DROP TRIGGER IF EXISTS trg_payment_immutable_update;
+DROP TRIGGER IF EXISTS trg_payment_immutable_delete;
+DROP TRIGGER IF EXISTS trg_after_sale_item_quota_deduction_update;
+DROP TRIGGER IF EXISTS trg_purchase_receipt_item_guard;
+DROP TRIGGER IF EXISTS trg_purchase_receipt_item_update_order_line;
+DROP TRIGGER IF EXISTS trg_purchase_return_item_guard;
+DROP TRIGGER IF EXISTS trg_purchase_return_item_update_order_line;
+DROP TRIGGER IF EXISTS trg_sale_return_item_guard;
+DROP TRIGGER IF EXISTS trg_sale_return_item_update_sale_line;
+
+-- Product creation automatically creates the simple stock item. Variants create their own stock items.
+CREATE TRIGGER trg_product_create_simple_stock_item AFTER INSERT ON products WHEN NEW.has_variants=0 BEGIN
+ INSERT INTO stock_items(id,product_id,variant_id) VALUES(lower(hex(randomblob(16))),NEW.id,NULL);
+END;
+CREATE TRIGGER trg_variant_create_stock_item AFTER INSERT ON product_variants BEGIN
+ SELECT CASE WHEN (SELECT has_variants FROM products WHERE id=NEW.product_id)!=1 THEN RAISE(ABORT,'PRODUCT_NOT_CONFIGURED_FOR_VARIANTS') END;
+ INSERT INTO stock_items(id,product_id,variant_id) VALUES(lower(hex(randomblob(16))),NEW.product_id,NEW.id);
+END;
+CREATE TRIGGER trg_product_variant_mode_immutable BEFORE UPDATE OF has_variants ON products WHEN EXISTS(SELECT 1 FROM stock_items WHERE product_id=OLD.id) BEGIN SELECT RAISE(ABORT,'PRODUCT_VARIANT_MODE_LOCKED_AFTER_STOCK_CREATION'); END;
+
+-- Barcode namespace is unique across products and variants.
+CREATE TRIGGER trg_products_barcode_cross_insert BEFORE INSERT ON products WHEN NEW.barcode IS NOT NULL AND NEW.barcode<>'' BEGIN
+ SELECT CASE WHEN EXISTS(SELECT 1 FROM product_variants WHERE barcode=NEW.barcode) THEN RAISE(ABORT,'BARCODE_ALREADY_IN_USE') END;
+END;
+CREATE TRIGGER trg_products_barcode_cross_update BEFORE UPDATE OF barcode ON products WHEN NEW.barcode IS NOT NULL AND NEW.barcode<>'' BEGIN
+ SELECT CASE WHEN EXISTS(SELECT 1 FROM product_variants WHERE barcode=NEW.barcode) THEN RAISE(ABORT,'BARCODE_ALREADY_IN_USE') END;
+END;
+CREATE TRIGGER trg_variants_barcode_cross_insert BEFORE INSERT ON product_variants WHEN NEW.barcode IS NOT NULL AND NEW.barcode<>'' BEGIN
+ SELECT CASE WHEN EXISTS(SELECT 1 FROM products WHERE barcode=NEW.barcode) THEN RAISE(ABORT,'BARCODE_ALREADY_IN_USE') END;
+END;
+CREATE TRIGGER trg_variants_barcode_cross_update BEFORE UPDATE OF barcode ON product_variants WHEN NEW.barcode IS NOT NULL AND NEW.barcode<>'' BEGIN
+ SELECT CASE WHEN EXISTS(SELECT 1 FROM products WHERE barcode=NEW.barcode) THEN RAISE(ABORT,'BARCODE_ALREADY_IN_USE') END;
+END;
+CREATE TRIGGER trg_price_item_variant_product BEFORE INSERT ON price_list_items WHEN NEW.variant_id IS NOT NULL BEGIN
+ SELECT CASE WHEN (SELECT product_id FROM product_variants WHERE id=NEW.variant_id) IS NOT NEW.product_id THEN RAISE(ABORT,'PRICE_VARIANT_PRODUCT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_price_item_variant_product_update BEFORE UPDATE OF product_id,variant_id ON price_list_items WHEN NEW.variant_id IS NOT NULL BEGIN
+ SELECT CASE WHEN (SELECT product_id FROM product_variants WHERE id=NEW.variant_id) IS NOT NEW.product_id THEN RAISE(ABORT,'PRICE_VARIANT_PRODUCT_MISMATCH') END;
+END;
+
+-- Tenant/store alignment.
+CREATE TRIGGER trg_warehouse_scope_insert BEFORE INSERT ON warehouses BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM stores WHERE id=NEW.store_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'WAREHOUSE_TENANT_STORE_MISMATCH') END;
+END;
+CREATE TRIGGER trg_warehouse_scope_update BEFORE UPDATE OF tenant_id,store_id ON warehouses BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM stores WHERE id=NEW.store_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'WAREHOUSE_TENANT_STORE_MISMATCH') END;
+END;
+CREATE TRIGGER trg_device_scope_insert BEFORE INSERT ON registered_devices BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM stores WHERE id=NEW.store_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'DEVICE_TENANT_STORE_MISMATCH') END;
+END;
+CREATE TRIGGER trg_device_scope_update BEFORE UPDATE OF tenant_id,store_id ON registered_devices BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM stores WHERE id=NEW.store_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'DEVICE_TENANT_STORE_MISMATCH') END;
+END;
+CREATE TRIGGER trg_product_category_scope BEFORE INSERT ON products WHEN NEW.category_id IS NOT NULL BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM categories WHERE id=NEW.category_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'PRODUCT_CATEGORY_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_customer_group_scope BEFORE INSERT ON customers WHEN NEW.group_id IS NOT NULL BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM customer_groups WHERE id=NEW.group_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'CUSTOMER_GROUP_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_cash_register_scope BEFORE INSERT ON cash_registers BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM stores WHERE id=NEW.store_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'CASH_REGISTER_TENANT_STORE_MISMATCH') END;
+END;
+CREATE TRIGGER trg_user_role_tenant_scope BEFORE INSERT ON user_roles BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM users WHERE id=NEW.user_id) IS NOT (SELECT tenant_id FROM roles WHERE id=NEW.role_id) THEN RAISE(ABORT,'USER_ROLE_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_purchase_scope_insert BEFORE INSERT ON purchases BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM suppliers WHERE id=NEW.supplier_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'PURCHASE_SUPPLIER_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM stores WHERE id=NEW.store_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'PURCHASE_STORE_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_purchase_scope_update BEFORE UPDATE OF tenant_id,store_id,supplier_id ON purchases BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM suppliers WHERE id=NEW.supplier_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'PURCHASE_SUPPLIER_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM stores WHERE id=NEW.store_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'PURCHASE_STORE_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_sale_scope_insert BEFORE INSERT ON sales BEGIN
+ SELECT CASE WHEN (SELECT store_id FROM warehouses WHERE id=NEW.warehouse_id) IS NOT NEW.store_id THEN RAISE(ABORT,'SALE_WAREHOUSE_STORE_MISMATCH') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM warehouses WHERE id=NEW.warehouse_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'SALE_WAREHOUSE_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM stores WHERE id=NEW.store_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'SALE_STORE_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM registered_devices WHERE id=NEW.device_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'SALE_DEVICE_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT store_id FROM registered_devices WHERE id=NEW.device_id) IS NOT NEW.store_id THEN RAISE(ABORT,'SALE_DEVICE_STORE_MISMATCH') END;
+ SELECT CASE WHEN NEW.customer_id IS NOT NULL AND (SELECT tenant_id FROM customers WHERE id=NEW.customer_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'SALE_CUSTOMER_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_sale_scope_update BEFORE UPDATE OF tenant_id,store_id,warehouse_id,device_id,customer_id ON sales BEGIN
+ SELECT CASE WHEN (SELECT store_id FROM warehouses WHERE id=NEW.warehouse_id) IS NOT NEW.store_id THEN RAISE(ABORT,'SALE_WAREHOUSE_STORE_MISMATCH') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM warehouses WHERE id=NEW.warehouse_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'SALE_WAREHOUSE_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM stores WHERE id=NEW.store_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'SALE_STORE_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM registered_devices WHERE id=NEW.device_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'SALE_DEVICE_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT store_id FROM registered_devices WHERE id=NEW.device_id) IS NOT NEW.store_id THEN RAISE(ABORT,'SALE_DEVICE_STORE_MISMATCH') END;
+ SELECT CASE WHEN NEW.customer_id IS NOT NULL AND (SELECT tenant_id FROM customers WHERE id=NEW.customer_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'SALE_CUSTOMER_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_sale_item_scope BEFORE INSERT ON sale_items BEGIN
+ SELECT CASE WHEN (SELECT p.tenant_id FROM stock_items si JOIN products p ON p.id=si.product_id WHERE si.id=NEW.stock_item_id) IS NOT (SELECT tenant_id FROM sales WHERE id=NEW.sale_id) THEN RAISE(ABORT,'SALE_ITEM_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_purchase_item_scope BEFORE INSERT ON purchase_items BEGIN
+ SELECT CASE WHEN (SELECT p.tenant_id FROM stock_items si JOIN products p ON p.id=si.product_id WHERE si.id=NEW.stock_item_id) IS NOT (SELECT tenant_id FROM purchases WHERE id=NEW.purchase_id) THEN RAISE(ABORT,'PURCHASE_ITEM_TENANT_MISMATCH') END;
+END;
+
+-- Fiscal year / numbering integrity.
+CREATE TRIGGER trg_fiscal_year_range_insert BEFORE INSERT ON fiscal_years BEGIN SELECT CASE WHEN NEW.start_date>NEW.end_date THEN RAISE(ABORT,'INVALID_FISCAL_YEAR_RANGE') END; END;
+CREATE TRIGGER trg_fiscal_year_range_update BEFORE UPDATE OF start_date,end_date ON fiscal_years BEGIN SELECT CASE WHEN NEW.start_date>NEW.end_date THEN RAISE(ABORT,'INVALID_FISCAL_YEAR_RANGE') END; END;
+CREATE TRIGGER trg_document_sequence_year BEFORE INSERT ON document_sequences BEGIN
+ SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM fiscal_years f JOIN stores s ON s.tenant_id=f.tenant_id WHERE f.tenant_id=NEW.tenant_id AND s.id=NEW.store_id AND f.year=NEW.fiscal_year AND f.is_closed=0) THEN RAISE(ABORT,'DOCUMENT_SEQUENCE_REQUIRES_OPEN_FISCAL_YEAR') END;
+END;
+CREATE TRIGGER trg_document_sequence_step BEFORE UPDATE OF last_sequence_number ON document_sequences BEGIN
+ SELECT CASE WHEN NEW.last_sequence_number!=OLD.last_sequence_number+1 THEN RAISE(ABORT,'DOCUMENT_SEQUENCE_MUST_INCREMENT_BY_ONE') END;
+ SELECT CASE WHEN EXISTS(SELECT 1 FROM fiscal_years WHERE tenant_id=NEW.tenant_id AND year=NEW.fiscal_year AND is_closed=1) THEN RAISE(ABORT,'FISCAL_YEAR_CLOSED') END;
+END;
+
+-- Movement ledger is the single source of truth for on-hand and moving-average cost.
+CREATE TRIGGER trg_inventory_movement_guard BEFORE INSERT ON inventory_movements BEGIN
+ SELECT CASE WHEN NEW.quantity_ticks<=0 THEN RAISE(ABORT,'MOVEMENT_QUANTITY_MUST_BE_POSITIVE') END;
+ SELECT CASE WHEN NEW.unit_cost_ticks<0 OR NEW.total_cost_centimes<0 THEN RAISE(ABORT,'MOVEMENT_COST_NEGATIVE') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM warehouses WHERE id=NEW.warehouse_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'MOVEMENT_WAREHOUSE_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT p.tenant_id FROM stock_items si JOIN products p ON p.id=si.product_id WHERE si.id=NEW.stock_item_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'MOVEMENT_STOCK_TENANT_MISMATCH') END;
+ SELECT CASE WHEN NEW.movement_type IN ('SALE_SHIPMENT','PURCHASE_RETURN','ADJUSTMENT_OUT','TRANSFER_OUT') AND COALESCE((SELECT on_hand_ticks-reserved_ticks FROM inventory_balances WHERE warehouse_id=NEW.warehouse_id AND stock_item_id=NEW.stock_item_id),0)<NEW.quantity_ticks THEN RAISE(ABORT,'INSUFFICIENT_AVAILABLE_STOCK') END;
+END;
+DROP TRIGGER IF EXISTS trg_inventory_movement_apply;
+CREATE TRIGGER trg_inventory_movement_apply AFTER INSERT ON inventory_movements BEGIN
+ INSERT OR IGNORE INTO inventory_balances(warehouse_id,stock_item_id,on_hand_ticks,reserved_ticks,current_moving_avg_cost)
+ VALUES(NEW.warehouse_id,NEW.stock_item_id,0,0,NEW.unit_cost_ticks);
+ UPDATE inventory_balances SET
+  current_moving_avg_cost=CASE WHEN NEW.movement_type IN ('PURCHASE_RECEIPT','SALE_RETURN','ADJUSTMENT_IN','TRANSFER_IN') THEN
+   CASE WHEN on_hand_ticks+NEW.quantity_ticks=0 THEN NEW.unit_cost_ticks ELSE CAST(((on_hand_ticks*current_moving_avg_cost)+(NEW.quantity_ticks*NEW.unit_cost_ticks))/(on_hand_ticks+NEW.quantity_ticks) AS INTEGER) END
+   ELSE current_moving_avg_cost END,
+  on_hand_ticks=on_hand_ticks+CASE WHEN NEW.movement_type IN ('PURCHASE_RECEIPT','SALE_RETURN','ADJUSTMENT_IN','TRANSFER_IN') THEN NEW.quantity_ticks ELSE -NEW.quantity_ticks END
+ WHERE warehouse_id=NEW.warehouse_id AND stock_item_id=NEW.stock_item_id;
+END;
+CREATE TRIGGER trg_inventory_movement_no_update BEFORE UPDATE ON inventory_movements BEGIN SELECT RAISE(ABORT,'INVENTORY_MOVEMENTS_ARE_IMMUTABLE'); END;
+CREATE TRIGGER trg_inventory_movement_no_delete BEFORE DELETE ON inventory_movements BEGIN SELECT RAISE(ABORT,'INVENTORY_MOVEMENTS_ARE_IMMUTABLE'); END;
+
+-- Offline quota issue reserves quantity; deduction consumes reservation and cannot exceed sale line quantity.
+CREATE TRIGGER trg_quota_issue_guard BEFORE INSERT ON inventory_quotas BEGIN
+ SELECT CASE WHEN NEW.status!='ACTIVE' THEN RAISE(ABORT,'NEW_QUOTA_MUST_START_ACTIVE') END;
+ SELECT CASE WHEN (SELECT pairing_status FROM registered_devices WHERE id=NEW.device_id)!='ACTIVE' THEN RAISE(ABORT,'QUOTA_DEVICE_NOT_ACTIVE') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM registered_devices WHERE id=NEW.device_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'QUOTA_DEVICE_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM warehouses WHERE id=NEW.warehouse_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'QUOTA_WAREHOUSE_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT p.tenant_id FROM stock_items si JOIN products p ON p.id=si.product_id WHERE si.id=NEW.stock_item_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'QUOTA_STOCK_TENANT_MISMATCH') END;
+ SELECT CASE WHEN COALESCE((SELECT on_hand_ticks-reserved_ticks FROM inventory_balances WHERE warehouse_id=NEW.warehouse_id AND stock_item_id=NEW.stock_item_id),0)<NEW.quota_quantity_ticks THEN RAISE(ABORT,'INSUFFICIENT_STOCK_TO_ISSUE_QUOTA') END;
+END;
+DROP TRIGGER IF EXISTS trg_quota_issue_reserve;
+CREATE TRIGGER trg_quota_issue_reserve AFTER INSERT ON inventory_quotas BEGIN
+ UPDATE inventory_balances SET reserved_ticks=reserved_ticks+NEW.quota_quantity_ticks
+ WHERE warehouse_id=NEW.warehouse_id AND stock_item_id=NEW.stock_item_id;
+END;
+CREATE TRIGGER trg_quota_deduction_guard BEFORE INSERT ON sale_item_quota_deductions BEGIN
+ SELECT CASE WHEN (SELECT stock_item_id FROM inventory_quotas WHERE id=NEW.quota_id) IS NOT (SELECT stock_item_id FROM sale_items WHERE id=NEW.sale_item_id) THEN RAISE(ABORT,'QUOTA_STOCK_ITEM_MISMATCH') END;
+ SELECT CASE WHEN (SELECT device_id FROM inventory_quotas WHERE id=NEW.quota_id) IS NOT (SELECT device_id FROM sales WHERE id=(SELECT sale_id FROM sale_items WHERE id=NEW.sale_item_id)) THEN RAISE(ABORT,'QUOTA_DEVICE_MISMATCH') END;
+ SELECT CASE WHEN (SELECT warehouse_id FROM inventory_quotas WHERE id=NEW.quota_id) IS NOT (SELECT warehouse_id FROM sales WHERE id=(SELECT sale_id FROM sale_items WHERE id=NEW.sale_item_id)) THEN RAISE(ABORT,'QUOTA_WAREHOUSE_MISMATCH') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM inventory_quotas WHERE id=NEW.quota_id) IS NOT (SELECT tenant_id FROM sales WHERE id=(SELECT sale_id FROM sale_items WHERE id=NEW.sale_item_id)) THEN RAISE(ABORT,'QUOTA_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT status FROM inventory_quotas WHERE id=NEW.quota_id)!='ACTIVE' OR (SELECT valid_until FROM inventory_quotas WHERE id=NEW.quota_id)<strftime('%Y-%m-%dT%H:%M:%fZ','now') THEN RAISE(ABORT,'QUOTA_INACTIVE_OR_EXPIRED') END;
+ SELECT CASE WHEN (SELECT consumed_quantity_ticks+NEW.deducted_quantity_ticks FROM inventory_quotas WHERE id=NEW.quota_id)>(SELECT quota_quantity_ticks FROM inventory_quotas WHERE id=NEW.quota_id) THEN RAISE(ABORT,'QUOTA_EXCEEDED') END;
+ SELECT CASE WHEN NEW.deducted_quantity_ticks+COALESCE((SELECT SUM(deducted_quantity_ticks) FROM sale_item_quota_deductions WHERE sale_item_id=NEW.sale_item_id),0)>(SELECT quantity_ticks FROM sale_items WHERE id=NEW.sale_item_id) THEN RAISE(ABORT,'QUOTA_DEDUCTION_EXCEEDS_SALE_LINE') END;
+END;
+CREATE TRIGGER trg_quota_deduction_apply AFTER INSERT ON sale_item_quota_deductions BEGIN
+ UPDATE inventory_quotas SET consumed_quantity_ticks=consumed_quantity_ticks+NEW.deducted_quantity_ticks WHERE id=NEW.quota_id;
+ UPDATE inventory_balances SET reserved_ticks=reserved_ticks-NEW.deducted_quantity_ticks WHERE warehouse_id=(SELECT warehouse_id FROM inventory_quotas WHERE id=NEW.quota_id) AND stock_item_id=(SELECT stock_item_id FROM inventory_quotas WHERE id=NEW.quota_id);
+END;
+CREATE TRIGGER trg_quota_deduction_immutable_update BEFORE UPDATE ON sale_item_quota_deductions BEGIN SELECT RAISE(ABORT,'QUOTA_DEDUCTIONS_ARE_IMMUTABLE'); END;
+CREATE TRIGGER trg_quota_deduction_delete_guard BEFORE DELETE ON sale_item_quota_deductions WHEN (SELECT status FROM sales WHERE id=(SELECT sale_id FROM sale_items WHERE id=OLD.sale_item_id))!='DRAFT' BEGIN SELECT RAISE(ABORT,'COMPLETED_QUOTA_DEDUCTIONS_ARE_IMMUTABLE'); END;
+CREATE TRIGGER trg_quota_deduction_delete_restore AFTER DELETE ON sale_item_quota_deductions BEGIN
+ UPDATE inventory_quotas SET consumed_quantity_ticks=consumed_quantity_ticks-OLD.deducted_quantity_ticks WHERE id=OLD.quota_id;
+ UPDATE inventory_balances SET reserved_ticks=reserved_ticks+OLD.deducted_quantity_ticks WHERE warehouse_id=(SELECT warehouse_id FROM inventory_quotas WHERE id=OLD.quota_id) AND stock_item_id=(SELECT stock_item_id FROM inventory_quotas WHERE id=OLD.quota_id);
+END;
+DROP TRIGGER IF EXISTS trg_quota_status_release;
+CREATE TRIGGER trg_quota_status_release BEFORE UPDATE OF status ON inventory_quotas WHEN OLD.status IN ('ACTIVE','LOST_DEVICE_EXPOSURE') AND NEW.status IN ('RECONCILED','EXPIRED','VOIDED_BY_ADMIN') BEGIN
+ UPDATE inventory_balances SET reserved_ticks=reserved_ticks-(OLD.quota_quantity_ticks-OLD.consumed_quantity_ticks) WHERE warehouse_id=OLD.warehouse_id AND stock_item_id=OLD.stock_item_id;
+END;
+CREATE TRIGGER trg_quota_no_delete BEFORE DELETE ON inventory_quotas BEGIN SELECT RAISE(ABORT,'INVENTORY_QUOTAS_ARE_IMMUTABLE'); END;
+
+-- Sale completion: signed operation metadata is mandatory, sequence is monotonic, and inventory is posted from the ledger.
+CREATE TRIGGER trg_sales_insert_draft_only BEFORE INSERT ON sales WHEN NEW.status!='DRAFT' BEGIN SELECT RAISE(ABORT,'SALES_MUST_START_AS_DRAFT'); END;
+DROP TRIGGER IF EXISTS trg_complete_sale_device_gate_update;
+CREATE TRIGGER trg_sale_completion_guard BEFORE UPDATE OF status ON sales WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' BEGIN
+ SELECT CASE WHEN NEW.device_seq_num IS NULL OR NEW.device_seq_num<=(SELECT last_seq_num FROM registered_devices WHERE id=NEW.device_id) THEN RAISE(ABORT,'DEVICE_SEQUENCE_NOT_MONOTONIC') END;
+ SELECT CASE WHEN NEW.device_signature IS NULL OR NEW.device_signature='' OR NEW.request_hash IS NULL OR NEW.request_hash='' OR NEW.local_operation_uuid IS NULL OR NEW.local_operation_uuid='' THEN RAISE(ABORT,'COMPLETED_SALE_REQUIRES_SIGNED_OPERATION_FIELDS') END;
+ SELECT CASE WHEN (SELECT pairing_status FROM registered_devices WHERE id=NEW.device_id)!='ACTIVE' THEN RAISE(ABORT,'DEVICE_NOT_ACTIVE') END;
+ SELECT CASE WHEN (SELECT COUNT(*) FROM sale_items WHERE sale_id=NEW.id)=0 THEN RAISE(ABORT,'SALE_REQUIRES_ITEMS') END;
+ SELECT CASE WHEN (SELECT COALESCE(SUM(line_total_centimes),0) FROM sale_items WHERE sale_id=NEW.id)!=NEW.total_amount_centimes THEN RAISE(ABORT,'SALE_TOTAL_DOES_NOT_MATCH_LINES') END;
+ SELECT CASE WHEN NEW.offline_receipt_number IS NOT NULL AND EXISTS(SELECT 1 FROM sale_items si WHERE si.sale_id=NEW.id AND COALESCE((SELECT SUM(deducted_quantity_ticks) FROM sale_item_quota_deductions qd WHERE qd.sale_item_id=si.id),0)!=si.quantity_ticks) THEN RAISE(ABORT,'OFFLINE_SALE_LINE_NOT_FULLY_COVERED_BY_QUOTA') END;
+END;
+CREATE TRIGGER trg_sale_completion_post AFTER UPDATE OF status ON sales WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' BEGIN
+ UPDATE registered_devices SET last_seq_num=NEW.device_seq_num,last_seen_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=NEW.device_id;
+ INSERT INTO inventory_movements(id,tenant_id,warehouse_id,stock_item_id,movement_type,source_event_id,reference_line_id,quantity_ticks,unit_cost_ticks,total_cost_centimes)
+ SELECT 'SALE_'||si.id,NEW.tenant_id,NEW.warehouse_id,si.stock_item_id,'SALE_SHIPMENT','SALE:'||NEW.id||':'||si.id,si.id,si.quantity_ticks,
+  COALESCE(NULLIF(si.cost_at_sale_ticks,0),(SELECT current_moving_avg_cost FROM inventory_balances WHERE warehouse_id=NEW.warehouse_id AND stock_item_id=si.stock_item_id),0),
+  CAST(si.quantity_ticks*COALESCE(NULLIF(si.cost_at_sale_ticks,0),(SELECT current_moving_avg_cost FROM inventory_balances WHERE warehouse_id=NEW.warehouse_id AND stock_item_id=si.stock_item_id),0)/1000000 AS INTEGER)
+ FROM sale_items si WHERE si.sale_id=NEW.id;
+END;
+CREATE TRIGGER trg_sale_item_cost_snapshot AFTER INSERT ON sale_items WHEN NEW.cost_at_sale_ticks=0 BEGIN
+ UPDATE sale_items SET cost_at_sale_ticks=COALESCE((SELECT current_moving_avg_cost FROM inventory_balances WHERE warehouse_id=(SELECT warehouse_id FROM sales WHERE id=NEW.sale_id) AND stock_item_id=NEW.stock_item_id),0) WHERE id=NEW.id;
+END;
+
+-- Payment lifecycle: draft allocations are validated, then all accounting effects post atomically.
+CREATE TRIGGER trg_payment_insert_draft_only BEFORE INSERT ON payments WHEN NEW.status!='DRAFT' BEGIN SELECT RAISE(ABORT,'PAYMENT_MUST_START_AS_DRAFT'); END;
+CREATE TRIGGER trg_payment_party_guard BEFORE INSERT ON payments BEGIN
+ SELECT CASE WHEN NEW.party_type='CUSTOMER' AND NOT EXISTS(SELECT 1 FROM customers WHERE id=NEW.party_id AND tenant_id=NEW.tenant_id) THEN RAISE(ABORT,'PAYMENT_CUSTOMER_NOT_FOUND') END;
+ SELECT CASE WHEN NEW.party_type='SUPPLIER' AND NOT EXISTS(SELECT 1 FROM suppliers WHERE id=NEW.party_id AND tenant_id=NEW.tenant_id) THEN RAISE(ABORT,'PAYMENT_SUPPLIER_NOT_FOUND') END;
+ SELECT CASE WHEN NEW.is_reversal=0 AND NEW.reversal_of_id IS NOT NULL THEN RAISE(ABORT,'NORMAL_PAYMENT_CANNOT_REFERENCE_REVERSAL') END;
+ SELECT CASE WHEN NEW.is_reversal=1 AND (NEW.reversal_of_id IS NULL OR NOT EXISTS(SELECT 1 FROM payments p WHERE p.id=NEW.reversal_of_id AND p.status='POSTED' AND p.is_reversal=0 AND p.tenant_id=NEW.tenant_id AND p.store_id=NEW.store_id AND p.party_type=NEW.party_type AND p.party_id=NEW.party_id AND p.amount=NEW.amount AND p.amount=(SELECT COALESCE(SUM(pa.allocated_amount),0) FROM payment_allocations pa WHERE pa.payment_id=p.id))) THEN RAISE(ABORT,'REVERSAL_MUST_MATCH_POSTED_FULLY_ALLOCATED_ORIGINAL') END;
+ SELECT CASE WHEN NEW.payment_method='CASH' AND NEW.shift_id IS NULL THEN RAISE(ABORT,'CASH_PAYMENT_REQUIRES_SHIFT') END;
+ SELECT CASE WHEN NEW.shift_id IS NOT NULL AND (SELECT status FROM cash_shifts WHERE id=NEW.shift_id)!='OPEN' THEN RAISE(ABORT,'PAYMENT_SHIFT_NOT_OPEN') END;
+ SELECT CASE WHEN NEW.shift_id IS NOT NULL AND (SELECT cr.store_id FROM cash_shifts cs JOIN cash_registers cr ON cr.id=cs.cash_register_id WHERE cs.id=NEW.shift_id) IS NOT NEW.store_id THEN RAISE(ABORT,'PAYMENT_SHIFT_STORE_MISMATCH') END;
+END;
+CREATE TRIGGER trg_payment_core_immutable BEFORE UPDATE OF tenant_id,store_id,party_type,party_id,payment_method,shift_id,amount,payment_date,notes,is_reversal,reversal_of_id ON payments BEGIN SELECT RAISE(ABORT,'PAYMENT_CORE_FIELDS_IMMUTABLE'); END;
+CREATE TRIGGER trg_payment_status_transition BEFORE UPDATE OF status ON payments BEGIN
+ SELECT CASE WHEN OLD.status!='DRAFT' OR NEW.status NOT IN ('POSTED','CANCELLED') THEN RAISE(ABORT,'INVALID_PAYMENT_STATUS_TRANSITION') END;
+ SELECT CASE WHEN NEW.status='POSTED' AND COALESCE((SELECT SUM(allocated_amount) FROM payment_allocations WHERE payment_id=OLD.id),0)>NEW.amount THEN RAISE(ABORT,'PAYMENT_ALLOCATIONS_EXCEED_PAYMENT') END;
+ SELECT CASE WHEN NEW.status='POSTED' AND OLD.is_reversal=1 AND COALESCE((SELECT SUM(allocated_amount) FROM payment_allocations WHERE payment_id=OLD.id),0)!=OLD.amount THEN RAISE(ABORT,'REVERSAL_ALLOCATIONS_MUST_EQUAL_PAYMENT') END;
+ SELECT CASE WHEN NEW.status='POSTED' AND OLD.is_reversal=1 AND (SELECT COUNT(*) FROM payment_allocations WHERE payment_id=OLD.id)!=(SELECT COUNT(*) FROM payment_allocations WHERE payment_id=OLD.reversal_of_id) THEN RAISE(ABORT,'REVERSAL_ALLOCATION_SET_INCOMPLETE') END;
+ SELECT CASE WHEN NEW.status='POSTED' AND OLD.is_reversal=0 AND EXISTS(SELECT 1 FROM payment_allocations pa JOIN sales s ON s.id=pa.sale_id WHERE pa.payment_id=OLD.id AND pa.allocated_amount>s.remaining_debt) THEN RAISE(ABORT,'PAYMENT_EXCEEDS_CURRENT_SALE_DEBT') END;
+ SELECT CASE WHEN NEW.status='POSTED' AND OLD.is_reversal=0 AND EXISTS(SELECT 1 FROM payment_allocations pa JOIN purchases pu ON pu.id=pa.purchase_id WHERE pa.payment_id=OLD.id AND pa.allocated_amount>pu.remaining_debt) THEN RAISE(ABORT,'PAYMENT_EXCEEDS_CURRENT_PURCHASE_DEBT') END;
+END;
+CREATE TRIGGER trg_payment_no_delete BEFORE DELETE ON payments BEGIN SELECT RAISE(ABORT,'PAYMENT_HISTORY_RETAINED'); END;
+CREATE TRIGGER trg_payment_allocation_guard BEFORE INSERT ON payment_allocations BEGIN
+ SELECT CASE WHEN (SELECT status FROM payments WHERE id=NEW.payment_id)!='DRAFT' THEN RAISE(ABORT,'ALLOCATIONS_REQUIRE_DRAFT_PAYMENT') END;
+ SELECT CASE WHEN NEW.allocated_amount<=0 THEN RAISE(ABORT,'ALLOCATION_MUST_BE_POSITIVE') END;
+ SELECT CASE WHEN COALESCE((SELECT SUM(allocated_amount) FROM payment_allocations WHERE payment_id=NEW.payment_id),0)+NEW.allocated_amount>(SELECT amount FROM payments WHERE id=NEW.payment_id) THEN RAISE(ABORT,'ALLOCATION_EXCEEDS_PAYMENT') END;
+ SELECT CASE WHEN NEW.sale_id IS NOT NULL AND (SELECT party_type FROM payments WHERE id=NEW.payment_id)!='CUSTOMER' THEN RAISE(ABORT,'SALE_REQUIRES_CUSTOMER_PAYMENT') END;
+ SELECT CASE WHEN NEW.sale_id IS NOT NULL AND (SELECT party_id FROM payments WHERE id=NEW.payment_id) IS NOT (SELECT customer_id FROM sales WHERE id=NEW.sale_id) THEN RAISE(ABORT,'SALE_CUSTOMER_MISMATCH') END;
+ SELECT CASE WHEN NEW.sale_id IS NOT NULL AND ((SELECT tenant_id FROM payments WHERE id=NEW.payment_id) IS NOT (SELECT tenant_id FROM sales WHERE id=NEW.sale_id) OR (SELECT store_id FROM payments WHERE id=NEW.payment_id) IS NOT (SELECT store_id FROM sales WHERE id=NEW.sale_id)) THEN RAISE(ABORT,'SALE_PAYMENT_SCOPE_MISMATCH') END;
+ SELECT CASE WHEN NEW.purchase_id IS NOT NULL AND (SELECT party_type FROM payments WHERE id=NEW.payment_id)!='SUPPLIER' THEN RAISE(ABORT,'PURCHASE_REQUIRES_SUPPLIER_PAYMENT') END;
+ SELECT CASE WHEN NEW.purchase_id IS NOT NULL AND (SELECT party_id FROM payments WHERE id=NEW.payment_id) IS NOT (SELECT supplier_id FROM purchases WHERE id=NEW.purchase_id) THEN RAISE(ABORT,'PURCHASE_SUPPLIER_MISMATCH') END;
+ SELECT CASE WHEN NEW.purchase_id IS NOT NULL AND ((SELECT tenant_id FROM payments WHERE id=NEW.payment_id) IS NOT (SELECT tenant_id FROM purchases WHERE id=NEW.purchase_id) OR (SELECT store_id FROM payments WHERE id=NEW.payment_id) IS NOT (SELECT store_id FROM purchases WHERE id=NEW.purchase_id)) THEN RAISE(ABORT,'PURCHASE_PAYMENT_SCOPE_MISMATCH') END;
+ SELECT CASE WHEN (SELECT is_reversal FROM payments WHERE id=NEW.payment_id)=1 AND NEW.sale_id IS NOT NULL AND NEW.allocated_amount IS NOT COALESCE((SELECT allocated_amount FROM payment_allocations WHERE payment_id=(SELECT reversal_of_id FROM payments WHERE id=NEW.payment_id) AND sale_id=NEW.sale_id),-1) THEN RAISE(ABORT,'REVERSAL_SALE_ALLOCATION_MISMATCH') END;
+ SELECT CASE WHEN (SELECT is_reversal FROM payments WHERE id=NEW.payment_id)=1 AND NEW.purchase_id IS NOT NULL AND NEW.allocated_amount IS NOT COALESCE((SELECT allocated_amount FROM payment_allocations WHERE payment_id=(SELECT reversal_of_id FROM payments WHERE id=NEW.payment_id) AND purchase_id=NEW.purchase_id),-1) THEN RAISE(ABORT,'REVERSAL_PURCHASE_ALLOCATION_MISMATCH') END;
+END;
+CREATE TRIGGER trg_allocation_no_update BEFORE UPDATE ON payment_allocations BEGIN SELECT RAISE(ABORT,'PAYMENT_ALLOCATIONS_ARE_IMMUTABLE'); END;
+CREATE TRIGGER trg_allocation_no_delete BEFORE DELETE ON payment_allocations BEGIN SELECT RAISE(ABORT,'PAYMENT_ALLOCATIONS_ARE_IMMUTABLE'); END;
+CREATE TRIGGER trg_payment_apply_sale_allocations AFTER UPDATE OF status ON payments WHEN OLD.status='DRAFT' AND NEW.status='POSTED' BEGIN
+ UPDATE sales SET paid_amount=paid_amount+(SELECT CASE WHEN NEW.is_reversal=1 THEN -SUM(pa.allocated_amount) ELSE SUM(pa.allocated_amount) END FROM payment_allocations pa WHERE pa.payment_id=NEW.id AND pa.sale_id=sales.id),
+  remaining_debt=remaining_debt+(SELECT CASE WHEN NEW.is_reversal=1 THEN SUM(pa.allocated_amount) ELSE -SUM(pa.allocated_amount) END FROM payment_allocations pa WHERE pa.payment_id=NEW.id AND pa.sale_id=sales.id)
+ WHERE id IN (SELECT sale_id FROM payment_allocations WHERE payment_id=NEW.id AND sale_id IS NOT NULL);
+END;
+CREATE TRIGGER trg_payment_apply_purchase_allocations AFTER UPDATE OF status ON payments WHEN OLD.status='DRAFT' AND NEW.status='POSTED' BEGIN
+ UPDATE purchases SET paid_amount=paid_amount+(SELECT CASE WHEN NEW.is_reversal=1 THEN -SUM(pa.allocated_amount) ELSE SUM(pa.allocated_amount) END FROM payment_allocations pa WHERE pa.payment_id=NEW.id AND pa.purchase_id=purchases.id),
+  remaining_debt=remaining_debt+(SELECT CASE WHEN NEW.is_reversal=1 THEN SUM(pa.allocated_amount) ELSE -SUM(pa.allocated_amount) END FROM payment_allocations pa WHERE pa.payment_id=NEW.id AND pa.purchase_id=purchases.id)
+ WHERE id IN (SELECT purchase_id FROM payment_allocations WHERE payment_id=NEW.id AND purchase_id IS NOT NULL);
+END;
+
+-- Cash ledger posts to the till and expected balance automatically.
+CREATE TRIGGER trg_cash_shift_opening AFTER INSERT ON cash_shifts BEGIN UPDATE cash_shifts SET expected_cash_centimes=NEW.opening_float_centimes WHERE id=NEW.id; END;
+CREATE TRIGGER trg_cash_movement_guard BEFORE INSERT ON cash_movements BEGIN
+ SELECT CASE WHEN (SELECT status FROM cash_shifts WHERE id=NEW.shift_id)!='OPEN' THEN RAISE(ABORT,'CASH_SHIFT_NOT_OPEN') END;
+END;
+CREATE TRIGGER trg_cash_movement_apply AFTER INSERT ON cash_movements BEGIN
+ UPDATE cash_shifts SET expected_cash_centimes=expected_cash_centimes+CASE WHEN NEW.movement_type IN ('FLOAT_ADD','MANUAL_IN','SALE_COLLECTION','CUSTOMER_DEBT_COLLECTION','SUPPLIER_REFUND') THEN NEW.amount_centimes ELSE -NEW.amount_centimes END WHERE id=NEW.shift_id;
+END;
+CREATE TRIGGER trg_cash_movement_no_update BEFORE UPDATE ON cash_movements BEGIN SELECT RAISE(ABORT,'CASH_MOVEMENTS_ARE_IMMUTABLE'); END;
+CREATE TRIGGER trg_cash_movement_no_delete BEFORE DELETE ON cash_movements BEGIN SELECT RAISE(ABORT,'CASH_MOVEMENTS_ARE_IMMUTABLE'); END;
+CREATE TRIGGER trg_payment_cash_post AFTER UPDATE OF status ON payments WHEN OLD.status='DRAFT' AND NEW.status='POSTED' AND NEW.payment_method='CASH' BEGIN
+ INSERT INTO cash_movements(id,shift_id,movement_type,amount_centimes,reason,source_event_id)
+ VALUES('PAY_'||NEW.id,NEW.shift_id,CASE WHEN NEW.party_type='CUSTOMER' AND NEW.is_reversal=0 THEN 'CUSTOMER_DEBT_COLLECTION' WHEN NEW.party_type='SUPPLIER' AND NEW.is_reversal=0 THEN 'SUPPLIER_PAYMENT' WHEN NEW.party_type='CUSTOMER' AND NEW.is_reversal=1 THEN 'CUSTOMER_REFUND' ELSE 'SUPPLIER_REFUND' END,NEW.amount,'Payment '||NEW.id,'PAYMENT:'||NEW.id);
+END;
+CREATE TRIGGER trg_expense_shift_guard BEFORE INSERT ON expenses WHEN NEW.shift_id IS NOT NULL BEGIN
+ SELECT CASE WHEN (SELECT status FROM cash_shifts WHERE id=NEW.shift_id)!='OPEN' THEN RAISE(ABORT,'EXPENSE_SHIFT_NOT_OPEN') END;
+ SELECT CASE WHEN (SELECT cr.store_id FROM cash_shifts cs JOIN cash_registers cr ON cr.id=cs.cash_register_id WHERE cs.id=NEW.shift_id) IS NOT NEW.store_id THEN RAISE(ABORT,'EXPENSE_SHIFT_STORE_MISMATCH') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM expense_categories WHERE id=NEW.category_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'EXPENSE_CATEGORY_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_expense_cash_post AFTER INSERT ON expenses WHEN NEW.shift_id IS NOT NULL BEGIN
+ INSERT INTO cash_movements(id,shift_id,movement_type,amount_centimes,reason,source_event_id) VALUES('EXP_'||NEW.id,NEW.shift_id,'PETTY_EXPENSE',NEW.amount_centimes,NEW.description,'EXPENSE:'||NEW.id);
+END;
+CREATE TRIGGER trg_cash_shift_close_guard BEFORE UPDATE OF status ON cash_shifts WHEN OLD.status='OPEN' AND NEW.status='CLOSED' BEGIN
+ SELECT CASE WHEN NEW.closed_at IS NULL OR NEW.actual_cash_centimes IS NULL THEN RAISE(ABORT,'SHIFT_CLOSE_REQUIRES_ACTUAL_CASH_AND_TIME') END;
+ SELECT CASE WHEN NEW.difference_centimes IS NOT (NEW.actual_cash_centimes-OLD.expected_cash_centimes) THEN RAISE(ABORT,'SHIFT_DIFFERENCE_MISMATCH') END;
+END;
+CREATE TRIGGER trg_cash_shift_no_reopen BEFORE UPDATE OF status ON cash_shifts WHEN OLD.status='CLOSED' AND NEW.status!='CLOSED' BEGIN SELECT RAISE(ABORT,'CLOSED_SHIFT_CANNOT_REOPEN'); END;
+
+-- Draft-first document lifecycle: receipts and returns post only on explicit completion.
+-- Lines may be inserted/deleted only while the parent document is DRAFT.
+
+-- PURCHASE RECEIPTS
+CREATE TRIGGER trg_receipt_header_scope BEFORE INSERT ON purchase_receipts BEGIN
+ SELECT CASE WHEN NEW.status!='DRAFT' THEN RAISE(ABORT,'RECEIPT_MUST_START_AS_DRAFT') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM purchases WHERE id=NEW.purchase_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'RECEIPT_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT store_id FROM warehouses WHERE id=NEW.warehouse_id) IS NOT (SELECT store_id FROM purchases WHERE id=NEW.purchase_id) THEN RAISE(ABORT,'RECEIPT_WAREHOUSE_STORE_MISMATCH') END;
+END;
+CREATE TRIGGER trg_receipt_item_exact_match BEFORE INSERT ON purchase_receipt_items BEGIN
+ SELECT CASE WHEN (SELECT status FROM purchase_receipts WHERE id=NEW.receipt_id)!='DRAFT' THEN RAISE(ABORT,'RECEIPT_LINES_REQUIRE_DRAFT') END;
+ SELECT CASE WHEN (SELECT purchase_id FROM purchase_items WHERE id=NEW.purchase_item_id) IS NOT (SELECT purchase_id FROM purchase_receipts WHERE id=NEW.receipt_id) THEN RAISE(ABORT,'RECEIPT_PURCHASE_MISMATCH') END;
+ SELECT CASE WHEN (SELECT stock_item_id FROM purchase_items WHERE id=NEW.purchase_item_id) IS NOT NEW.stock_item_id THEN RAISE(ABORT,'RECEIPT_STOCK_ITEM_MISMATCH') END;
+ SELECT CASE WHEN (SELECT quantity_received_ticks+NEW.quantity_received_ticks FROM purchase_items WHERE id=NEW.purchase_item_id)>(SELECT quantity_ordered_ticks FROM purchase_items WHERE id=NEW.purchase_item_id) THEN RAISE(ABORT,'RECEIPT_OVER_ORDER') END;
+END;
+CREATE TRIGGER trg_receipt_item_counter_add AFTER INSERT ON purchase_receipt_items BEGIN
+ UPDATE purchase_items SET quantity_received_ticks=quantity_received_ticks+NEW.quantity_received_ticks WHERE id=NEW.purchase_item_id;
+END;
+CREATE TRIGGER trg_receipt_item_no_update BEFORE UPDATE ON purchase_receipt_items BEGIN SELECT RAISE(ABORT,'RECEIPT_LINES_ARE_IMMUTABLE_REPLACE_DRAFT_LINE'); END;
+CREATE TRIGGER trg_receipt_item_delete_draft BEFORE DELETE ON purchase_receipt_items BEGIN
+ SELECT CASE WHEN (SELECT status FROM purchase_receipts WHERE id=OLD.receipt_id)!='DRAFT' THEN RAISE(ABORT,'NON_DRAFT_RECEIPT_LINES_IMMUTABLE') END;
+ UPDATE purchase_items SET quantity_received_ticks=quantity_received_ticks-OLD.quantity_received_ticks WHERE id=OLD.purchase_item_id;
+END;
+CREATE TRIGGER trg_receipt_complete_guard BEFORE UPDATE OF status ON purchase_receipts WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' BEGIN
+ SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM purchase_receipt_items WHERE receipt_id=OLD.id) THEN RAISE(ABORT,'EMPTY_RECEIPT_CANNOT_COMPLETE') END;
+END;
+CREATE TRIGGER trg_receipt_complete_post AFTER UPDATE OF status ON purchase_receipts WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' BEGIN
+ INSERT INTO inventory_movements(id,tenant_id,warehouse_id,stock_item_id,movement_type,source_event_id,reference_line_id,quantity_ticks,unit_cost_ticks,total_cost_centimes)
+ SELECT 'GRN_'||pri.id,NEW.tenant_id,NEW.warehouse_id,pri.stock_item_id,'PURCHASE_RECEIPT','RECEIPT:'||pri.id,pri.id,pri.quantity_received_ticks,pri.unit_cost_ticks,CAST(pri.quantity_received_ticks*pri.unit_cost_ticks/1000000 AS INTEGER)
+ FROM purchase_receipt_items pri WHERE pri.receipt_id=NEW.id;
+ UPDATE purchases SET fulfillment_status=CASE WHEN NOT EXISTS(SELECT 1 FROM purchase_items WHERE purchase_id=NEW.purchase_id AND quantity_received_ticks<quantity_ordered_ticks) THEN 'FULLY_RECEIVED' ELSE 'PARTIALLY_RECEIVED' END,
+  status=CASE WHEN NOT EXISTS(SELECT 1 FROM purchase_items WHERE purchase_id=NEW.purchase_id AND quantity_received_ticks<quantity_ordered_ticks) THEN 'RECEIVED' ELSE 'ORDERED' END
+ WHERE id=NEW.purchase_id;
+END;
+CREATE TRIGGER trg_receipt_cancel_restore AFTER UPDATE OF status ON purchase_receipts WHEN OLD.status='DRAFT' AND NEW.status='CANCELLED' BEGIN
+ UPDATE purchase_items SET quantity_received_ticks=quantity_received_ticks-(SELECT COALESCE(SUM(quantity_received_ticks),0) FROM purchase_receipt_items WHERE receipt_id=OLD.id)
+ WHERE id IN (SELECT purchase_item_id FROM purchase_receipt_items WHERE receipt_id=OLD.id);
+END;
+CREATE TRIGGER trg_receipt_header_no_update BEFORE UPDATE ON purchase_receipts WHEN OLD.status!='DRAFT' BEGIN SELECT RAISE(ABORT,'NON_DRAFT_RECEIPT_IMMUTABLE'); END;
+CREATE TRIGGER trg_receipt_header_fields_locked BEFORE UPDATE OF tenant_id,purchase_id,warehouse_id,receipt_number,received_at ON purchase_receipts BEGIN SELECT RAISE(ABORT,'RECEIPT_HEADER_FIELDS_IMMUTABLE'); END;
+CREATE TRIGGER trg_receipt_header_no_delete BEFORE DELETE ON purchase_receipts WHEN OLD.status!='DRAFT' BEGIN SELECT RAISE(ABORT,'NON_DRAFT_RECEIPT_IMMUTABLE'); END;
+
+-- PURCHASE RETURNS
+CREATE TRIGGER trg_purchase_return_scope BEFORE INSERT ON purchase_returns BEGIN
+ SELECT CASE WHEN NEW.status!='DRAFT' THEN RAISE(ABORT,'PURCHASE_RETURN_MUST_START_AS_DRAFT') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM purchases WHERE id=NEW.purchase_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'PURCHASE_RETURN_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT supplier_id FROM purchases WHERE id=NEW.purchase_id) IS NOT NEW.supplier_id THEN RAISE(ABORT,'PURCHASE_RETURN_SUPPLIER_MISMATCH') END;
+ SELECT CASE WHEN (SELECT store_id FROM warehouses WHERE id=NEW.warehouse_id) IS NOT (SELECT store_id FROM purchases WHERE id=NEW.purchase_id) THEN RAISE(ABORT,'PURCHASE_RETURN_WAREHOUSE_STORE_MISMATCH') END;
+END;
+CREATE TRIGGER trg_purchase_return_item_exact_match BEFORE INSERT ON purchase_return_items BEGIN
+ SELECT CASE WHEN (SELECT status FROM purchase_returns WHERE id=NEW.purchase_return_id)!='DRAFT' THEN RAISE(ABORT,'PURCHASE_RETURN_LINES_REQUIRE_DRAFT') END;
+ SELECT CASE WHEN (SELECT purchase_id FROM purchase_items WHERE id=NEW.purchase_item_id) IS NOT (SELECT purchase_id FROM purchase_returns WHERE id=NEW.purchase_return_id) THEN RAISE(ABORT,'PURCHASE_RETURN_ORDER_MISMATCH') END;
+ SELECT CASE WHEN (SELECT stock_item_id FROM purchase_items WHERE id=NEW.purchase_item_id) IS NOT NEW.stock_item_id THEN RAISE(ABORT,'PURCHASE_RETURN_STOCK_ITEM_MISMATCH') END;
+ SELECT CASE WHEN (SELECT quantity_returned_ticks+NEW.returned_quantity_ticks FROM purchase_items WHERE id=NEW.purchase_item_id)>(SELECT quantity_received_ticks FROM purchase_items WHERE id=NEW.purchase_item_id) THEN RAISE(ABORT,'PURCHASE_RETURN_OVER_RECEIVED') END;
+ SELECT CASE WHEN COALESCE((SELECT on_hand_ticks-reserved_ticks FROM inventory_balances WHERE warehouse_id=(SELECT warehouse_id FROM purchase_returns WHERE id=NEW.purchase_return_id) AND stock_item_id=NEW.stock_item_id),0)<NEW.returned_quantity_ticks THEN RAISE(ABORT,'PURCHASE_RETURN_STOCK_UNAVAILABLE') END;
+ SELECT CASE WHEN NEW.line_total_centimes+COALESCE((SELECT SUM(line_total_centimes) FROM purchase_return_items WHERE purchase_return_id=NEW.purchase_return_id),0)>(SELECT total_credit_centimes FROM purchase_returns WHERE id=NEW.purchase_return_id) THEN RAISE(ABORT,'PURCHASE_RETURN_HEADER_VALUE_EXCEEDED') END;
+END;
+CREATE TRIGGER trg_purchase_return_item_counter_add AFTER INSERT ON purchase_return_items BEGIN
+ UPDATE purchase_items SET quantity_returned_ticks=quantity_returned_ticks+NEW.returned_quantity_ticks WHERE id=NEW.purchase_item_id;
+END;
+CREATE TRIGGER trg_purchase_return_item_no_update BEFORE UPDATE ON purchase_return_items BEGIN SELECT RAISE(ABORT,'PURCHASE_RETURN_LINES_ARE_IMMUTABLE_REPLACE_DRAFT_LINE'); END;
+CREATE TRIGGER trg_purchase_return_item_delete_draft BEFORE DELETE ON purchase_return_items BEGIN
+ SELECT CASE WHEN (SELECT status FROM purchase_returns WHERE id=OLD.purchase_return_id)!='DRAFT' THEN RAISE(ABORT,'NON_DRAFT_PURCHASE_RETURN_LINES_IMMUTABLE') END;
+ UPDATE purchase_items SET quantity_returned_ticks=quantity_returned_ticks-OLD.returned_quantity_ticks WHERE id=OLD.purchase_item_id;
+END;
+CREATE TRIGGER trg_purchase_return_complete_guard BEFORE UPDATE OF status ON purchase_returns WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' BEGIN
+ SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM purchase_return_items WHERE purchase_return_id=OLD.id) THEN RAISE(ABORT,'EMPTY_PURCHASE_RETURN_CANNOT_COMPLETE') END;
+ SELECT CASE WHEN (SELECT COALESCE(SUM(line_total_centimes),0) FROM purchase_return_items WHERE purchase_return_id=OLD.id)!=NEW.total_credit_centimes THEN RAISE(ABORT,'PURCHASE_RETURN_TOTAL_MISMATCH') END;
+END;
+CREATE TRIGGER trg_purchase_return_complete_post AFTER UPDATE OF status ON purchase_returns WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' BEGIN
+ INSERT INTO inventory_movements(id,tenant_id,warehouse_id,stock_item_id,movement_type,source_event_id,reference_line_id,quantity_ticks,unit_cost_ticks,total_cost_centimes)
+ SELECT 'PRT_'||pri.id,NEW.tenant_id,NEW.warehouse_id,pri.stock_item_id,'PURCHASE_RETURN','PURCHASE_RETURN:'||pri.id,pri.id,pri.returned_quantity_ticks,pri.unit_cost_ticks,pri.line_total_centimes
+ FROM purchase_return_items pri WHERE pri.purchase_return_id=NEW.id;
+END;
+CREATE TRIGGER trg_purchase_return_cancel_restore AFTER UPDATE OF status ON purchase_returns WHEN OLD.status='DRAFT' AND NEW.status='CANCELLED' BEGIN
+ UPDATE purchase_items SET quantity_returned_ticks=quantity_returned_ticks-(SELECT COALESCE(SUM(returned_quantity_ticks),0) FROM purchase_return_items WHERE purchase_return_id=OLD.id)
+ WHERE id IN (SELECT purchase_item_id FROM purchase_return_items WHERE purchase_return_id=OLD.id);
+END;
+CREATE TRIGGER trg_purchase_return_item_no_update_after BEFORE UPDATE ON purchase_return_items WHEN (SELECT status FROM purchase_returns WHERE id=OLD.purchase_return_id)!='DRAFT' BEGIN SELECT RAISE(ABORT,'NON_DRAFT_PURCHASE_RETURN_LINES_IMMUTABLE'); END;
+CREATE TRIGGER trg_purchase_return_header_no_update BEFORE UPDATE ON purchase_returns WHEN OLD.status!='DRAFT' BEGIN SELECT RAISE(ABORT,'NON_DRAFT_PURCHASE_RETURN_IMMUTABLE'); END;
+CREATE TRIGGER trg_purchase_return_header_fields_locked BEFORE UPDATE OF tenant_id,purchase_id,supplier_id,warehouse_id,return_number,total_credit_centimes,created_at ON purchase_returns BEGIN SELECT RAISE(ABORT,'PURCHASE_RETURN_HEADER_FIELDS_IMMUTABLE'); END;
+CREATE TRIGGER trg_purchase_return_header_no_delete BEFORE DELETE ON purchase_returns WHEN OLD.status!='DRAFT' BEGIN SELECT RAISE(ABORT,'NON_DRAFT_PURCHASE_RETURN_IMMUTABLE'); END;
+
+-- SALE RETURNS
+CREATE TRIGGER trg_sale_return_scope BEFORE INSERT ON sale_returns BEGIN
+ SELECT CASE WHEN NEW.status!='DRAFT' THEN RAISE(ABORT,'SALE_RETURN_MUST_START_AS_DRAFT') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM sales WHERE id=NEW.original_sale_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'SALE_RETURN_TENANT_MISMATCH') END;
+ SELECT CASE WHEN (SELECT store_id FROM sales WHERE id=NEW.original_sale_id) IS NOT NEW.store_id THEN RAISE(ABORT,'SALE_RETURN_STORE_MISMATCH') END;
+ SELECT CASE WHEN (SELECT warehouse_id FROM sales WHERE id=NEW.original_sale_id) IS NOT NEW.warehouse_id THEN RAISE(ABORT,'SALE_RETURN_WAREHOUSE_MISMATCH') END;
+ SELECT CASE WHEN (SELECT customer_id FROM sales WHERE id=NEW.original_sale_id) IS NOT NEW.customer_id THEN RAISE(ABORT,'SALE_RETURN_CUSTOMER_MISMATCH') END;
+ SELECT CASE WHEN NEW.refund_status='REFUNDED_CASH' AND (NEW.shift_id IS NULL OR (SELECT status FROM cash_shifts WHERE id=NEW.shift_id)!='OPEN') THEN RAISE(ABORT,'CASH_REFUND_REQUIRES_OPEN_SHIFT') END;
+ SELECT CASE WHEN NEW.refund_status='REFUNDED_CASH' AND (SELECT cr.store_id FROM cash_shifts cs JOIN cash_registers cr ON cr.id=cs.cash_register_id WHERE cs.id=NEW.shift_id) IS NOT NEW.store_id THEN RAISE(ABORT,'CASH_REFUND_SHIFT_STORE_MISMATCH') END;
+ SELECT CASE WHEN NEW.total_refund_centimes>(SELECT total_amount_centimes-COALESCE((SELECT SUM(total_refund_centimes) FROM sale_returns WHERE original_sale_id=NEW.original_sale_id AND status='COMPLETED'),0) FROM sales WHERE id=NEW.original_sale_id) THEN RAISE(ABORT,'SALE_RETURN_REFUND_OVER_TOTAL') END;
+END;
+CREATE TRIGGER trg_sale_return_item_exact_match BEFORE INSERT ON sale_return_items BEGIN
+ SELECT CASE WHEN (SELECT status FROM sale_returns WHERE id=NEW.return_id)!='DRAFT' THEN RAISE(ABORT,'SALE_RETURN_LINES_REQUIRE_DRAFT') END;
+ SELECT CASE WHEN (SELECT sale_id FROM sale_items WHERE id=NEW.original_sale_item_id) IS NOT (SELECT original_sale_id FROM sale_returns WHERE id=NEW.return_id) THEN RAISE(ABORT,'SALE_RETURN_SOURCE_MISMATCH') END;
+ SELECT CASE WHEN (SELECT stock_item_id FROM sale_items WHERE id=NEW.original_sale_item_id) IS NOT NEW.stock_item_id THEN RAISE(ABORT,'SALE_RETURN_STOCK_ITEM_MISMATCH') END;
+ SELECT CASE WHEN (SELECT returned_quantity_ticks+NEW.returned_quantity_ticks FROM sale_items WHERE id=NEW.original_sale_item_id)>(SELECT quantity_ticks FROM sale_items WHERE id=NEW.original_sale_item_id) THEN RAISE(ABORT,'SALE_RETURN_OVER_SOLD') END;
+ SELECT CASE WHEN NEW.line_total_centimes+COALESCE((SELECT SUM(line_total_centimes) FROM sale_return_items WHERE original_sale_item_id=NEW.original_sale_item_id),0)>(SELECT line_total_centimes FROM sale_items WHERE id=NEW.original_sale_item_id) THEN RAISE(ABORT,'SALE_RETURN_LINE_VALUE_EXCEEDED') END;
+ SELECT CASE WHEN NEW.line_total_centimes+COALESCE((SELECT SUM(line_total_centimes) FROM sale_return_items WHERE return_id=NEW.return_id),0)>(SELECT total_refund_centimes FROM sale_returns WHERE id=NEW.return_id) THEN RAISE(ABORT,'SALE_RETURN_HEADER_VALUE_EXCEEDED') END;
+END;
+CREATE TRIGGER trg_sale_return_item_counter_add AFTER INSERT ON sale_return_items BEGIN
+ UPDATE sale_items SET returned_quantity_ticks=returned_quantity_ticks+NEW.returned_quantity_ticks WHERE id=NEW.original_sale_item_id;
+END;
+CREATE TRIGGER trg_sale_return_item_no_update BEFORE UPDATE ON sale_return_items BEGIN SELECT RAISE(ABORT,'SALE_RETURN_LINES_ARE_IMMUTABLE_REPLACE_DRAFT_LINE'); END;
+CREATE TRIGGER trg_sale_return_item_delete_draft BEFORE DELETE ON sale_return_items BEGIN
+ SELECT CASE WHEN (SELECT status FROM sale_returns WHERE id=OLD.return_id)!='DRAFT' THEN RAISE(ABORT,'NON_DRAFT_SALE_RETURN_LINES_IMMUTABLE') END;
+ UPDATE sale_items SET returned_quantity_ticks=returned_quantity_ticks-OLD.returned_quantity_ticks WHERE id=OLD.original_sale_item_id;
+END;
+CREATE TRIGGER trg_sale_return_complete_guard BEFORE UPDATE OF status ON sale_returns WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' BEGIN
+ SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM sale_return_items WHERE return_id=OLD.id) THEN RAISE(ABORT,'EMPTY_SALE_RETURN_CANNOT_COMPLETE') END;
+ SELECT CASE WHEN (SELECT COALESCE(SUM(line_total_centimes),0) FROM sale_return_items WHERE return_id=OLD.id)!=NEW.total_refund_centimes THEN RAISE(ABORT,'SALE_RETURN_TOTAL_MISMATCH') END;
+ SELECT CASE WHEN NEW.refund_status='REFUNDED_CASH' AND (NEW.shift_id IS NULL OR (SELECT status FROM cash_shifts WHERE id=NEW.shift_id)!='OPEN') THEN RAISE(ABORT,'CASH_REFUND_REQUIRES_OPEN_SHIFT') END;
+END;
+CREATE TRIGGER trg_sale_return_complete_post AFTER UPDATE OF status ON sale_returns WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' BEGIN
+ INSERT INTO inventory_movements(id,tenant_id,warehouse_id,stock_item_id,movement_type,source_event_id,reference_line_id,quantity_ticks,unit_cost_ticks,total_cost_centimes)
+ SELECT 'SRT_'||sri.id,sr.tenant_id,sr.warehouse_id,sri.stock_item_id,'SALE_RETURN','SALE_RETURN:'||sri.id,sri.id,sri.returned_quantity_ticks,si.cost_at_sale_ticks,CAST(sri.returned_quantity_ticks*si.cost_at_sale_ticks/1000000 AS INTEGER)
+ FROM sale_return_items sri JOIN sale_items si ON si.id=sri.original_sale_item_id JOIN sale_returns sr ON sr.id=sri.return_id WHERE sri.return_id=NEW.id;
+END;
+CREATE TRIGGER trg_sale_return_cash_post AFTER UPDATE OF status ON sale_returns WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' AND NEW.refund_status='REFUNDED_CASH' BEGIN
+ INSERT INTO cash_movements(id,shift_id,movement_type,amount_centimes,reason,source_event_id) VALUES('SRF_'||NEW.id,NEW.shift_id,'CUSTOMER_REFUND',NEW.total_refund_centimes,'Sale return '||NEW.return_number,'SALE_RETURN:'||NEW.id);
+END;
+CREATE TRIGGER trg_sale_return_account_ledger AFTER UPDATE OF status ON sale_returns WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' AND NEW.refund_status='CREDITED_TO_ACCOUNT' AND NEW.customer_id IS NOT NULL BEGIN
+ INSERT INTO party_ledger_entries(id,tenant_id,party_type,party_id,source_document_type,source_document_id,debit_centimes,credit_centimes,running_balance_centimes,notes)
+ SELECT 'LED_SRET_'||NEW.id,NEW.tenant_id,'CUSTOMER',NEW.customer_id,'SALE_RETURN',NEW.id,0,NEW.total_refund_centimes,current_balance_centimes-NEW.total_refund_centimes,'Sale return '||NEW.return_number FROM customers WHERE id=NEW.customer_id;
+END;
+CREATE TRIGGER trg_sale_return_cancel_restore AFTER UPDATE OF status ON sale_returns WHEN OLD.status='DRAFT' AND NEW.status='CANCELLED' BEGIN
+ UPDATE sale_items SET returned_quantity_ticks=returned_quantity_ticks-(SELECT COALESCE(SUM(returned_quantity_ticks),0) FROM sale_return_items WHERE return_id=OLD.id)
+ WHERE id IN (SELECT original_sale_item_id FROM sale_return_items WHERE return_id=OLD.id);
+END;
+CREATE TRIGGER trg_sale_return_item_no_update_after BEFORE UPDATE ON sale_return_items WHEN (SELECT status FROM sale_returns WHERE id=OLD.return_id)!='DRAFT' BEGIN SELECT RAISE(ABORT,'NON_DRAFT_SALE_RETURN_LINES_IMMUTABLE'); END;
+CREATE TRIGGER trg_sale_return_header_no_update BEFORE UPDATE ON sale_returns WHEN OLD.status!='DRAFT' BEGIN SELECT RAISE(ABORT,'NON_DRAFT_SALE_RETURN_IMMUTABLE'); END;
+CREATE TRIGGER trg_sale_return_header_fields_locked BEFORE UPDATE OF tenant_id,store_id,warehouse_id,original_sale_id,return_number,customer_id,shift_id,total_refund_centimes,refund_status,created_at ON sale_returns BEGIN SELECT RAISE(ABORT,'SALE_RETURN_HEADER_FIELDS_IMMUTABLE'); END;
+CREATE TRIGGER trg_sale_return_header_no_delete BEFORE DELETE ON sale_returns WHEN OLD.status!='DRAFT' BEGIN SELECT RAISE(ABORT,'NON_DRAFT_SALE_RETURN_IMMUTABLE'); END;
+
+-- Ledger balances and event posting: customer balance is receivable; supplier balance is payable.
+CREATE TRIGGER trg_ledger_party_guard BEFORE INSERT ON party_ledger_entries BEGIN
+ SELECT CASE WHEN NEW.party_type='CUSTOMER' AND NOT EXISTS(SELECT 1 FROM customers WHERE id=NEW.party_id AND tenant_id=NEW.tenant_id) THEN RAISE(ABORT,'LEDGER_CUSTOMER_NOT_FOUND') END;
+ SELECT CASE WHEN NEW.party_type='SUPPLIER' AND NOT EXISTS(SELECT 1 FROM suppliers WHERE id=NEW.party_id AND tenant_id=NEW.tenant_id) THEN RAISE(ABORT,'LEDGER_SUPPLIER_NOT_FOUND') END;
+ SELECT CASE WHEN NEW.debit_centimes=0 AND NEW.credit_centimes=0 THEN RAISE(ABORT,'LEDGER_AMOUNT_REQUIRED') END;
+ SELECT CASE WHEN NEW.debit_centimes>0 AND NEW.credit_centimes>0 THEN RAISE(ABORT,'LEDGER_DEBIT_AND_CREDIT_MUTUALLY_EXCLUSIVE') END;
+ SELECT CASE WHEN NEW.party_type='CUSTOMER' AND NEW.running_balance_centimes!=(SELECT current_balance_centimes+NEW.debit_centimes-NEW.credit_centimes FROM customers WHERE id=NEW.party_id) THEN RAISE(ABORT,'CUSTOMER_RUNNING_BALANCE_MISMATCH') END;
+ SELECT CASE WHEN NEW.party_type='SUPPLIER' AND NEW.running_balance_centimes!=(SELECT current_balance_centimes+NEW.credit_centimes-NEW.debit_centimes FROM suppliers WHERE id=NEW.party_id) THEN RAISE(ABORT,'SUPPLIER_RUNNING_BALANCE_MISMATCH') END;
+END;
+CREATE TRIGGER trg_ledger_apply_customer AFTER INSERT ON party_ledger_entries WHEN NEW.party_type='CUSTOMER' BEGIN UPDATE customers SET current_balance_centimes=current_balance_centimes+NEW.debit_centimes-NEW.credit_centimes WHERE id=NEW.party_id; END;
+CREATE TRIGGER trg_ledger_apply_supplier AFTER INSERT ON party_ledger_entries WHEN NEW.party_type='SUPPLIER' BEGIN UPDATE suppliers SET current_balance_centimes=current_balance_centimes+NEW.credit_centimes-NEW.debit_centimes WHERE id=NEW.party_id; END;
+CREATE TRIGGER trg_ledger_no_update BEFORE UPDATE ON party_ledger_entries BEGIN SELECT RAISE(ABORT,'PARTY_LEDGER_IS_IMMUTABLE'); END;
+CREATE TRIGGER trg_ledger_no_delete BEFORE DELETE ON party_ledger_entries BEGIN SELECT RAISE(ABORT,'PARTY_LEDGER_IS_IMMUTABLE'); END;
+CREATE TRIGGER trg_sale_ledger_post AFTER UPDATE OF status ON sales WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' AND NEW.customer_id IS NOT NULL BEGIN
+ INSERT INTO party_ledger_entries(id,tenant_id,party_type,party_id,source_document_type,source_document_id,debit_centimes,credit_centimes,running_balance_centimes,notes)
+ SELECT 'LED_SALE_'||NEW.id,NEW.tenant_id,'CUSTOMER',NEW.customer_id,'SALE',NEW.id,NEW.total_amount_centimes,0,current_balance_centimes+NEW.total_amount_centimes,'Sale '||NEW.id FROM customers WHERE id=NEW.customer_id;
+END;
+CREATE TRIGGER trg_purchase_ledger_post AFTER UPDATE OF status ON purchases WHEN OLD.status='DRAFT' AND NEW.status='ORDERED' BEGIN
+ INSERT INTO party_ledger_entries(id,tenant_id,party_type,party_id,source_document_type,source_document_id,debit_centimes,credit_centimes,running_balance_centimes,notes)
+ SELECT 'LED_PUR_'||NEW.id,NEW.tenant_id,'SUPPLIER',NEW.supplier_id,'PURCHASE',NEW.id,0,NEW.total_amount_centimes,current_balance_centimes+NEW.total_amount_centimes,'Purchase '||NEW.order_number FROM suppliers WHERE id=NEW.supplier_id;
+END;
+CREATE TRIGGER trg_payment_ledger_post AFTER UPDATE OF status ON payments WHEN OLD.status='DRAFT' AND NEW.status='POSTED' BEGIN
+ INSERT INTO party_ledger_entries(id,tenant_id,party_type,party_id,source_document_type,source_document_id,debit_centimes,credit_centimes,running_balance_centimes,notes)
+ SELECT 'LED_PAY_'||NEW.id,NEW.tenant_id,'CUSTOMER',NEW.party_id,'PAYMENT',NEW.id,CASE WHEN NEW.is_reversal=1 THEN NEW.amount ELSE 0 END,CASE WHEN NEW.is_reversal=0 THEN NEW.amount ELSE 0 END,current_balance_centimes+CASE WHEN NEW.is_reversal=1 THEN NEW.amount ELSE -NEW.amount END,'Payment '||NEW.id FROM customers WHERE NEW.party_type='CUSTOMER' AND id=NEW.party_id;
+ INSERT INTO party_ledger_entries(id,tenant_id,party_type,party_id,source_document_type,source_document_id,debit_centimes,credit_centimes,running_balance_centimes,notes)
+ SELECT 'LED_PAY_'||NEW.id,NEW.tenant_id,'SUPPLIER',NEW.party_id,'PAYMENT',NEW.id,CASE WHEN NEW.is_reversal=0 THEN NEW.amount ELSE 0 END,CASE WHEN NEW.is_reversal=1 THEN NEW.amount ELSE 0 END,current_balance_centimes+CASE WHEN NEW.is_reversal=1 THEN NEW.amount ELSE -NEW.amount END,'Payment '||NEW.id FROM suppliers WHERE NEW.party_type='SUPPLIER' AND id=NEW.party_id;
+END;
+CREATE TRIGGER trg_purchase_return_ledger_post AFTER UPDATE OF status ON purchase_returns WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' BEGIN
+ INSERT INTO party_ledger_entries(id,tenant_id,party_type,party_id,source_document_type,source_document_id,debit_centimes,credit_centimes,running_balance_centimes,notes)
+ SELECT 'LED_PRET_'||NEW.id,NEW.tenant_id,'SUPPLIER',NEW.supplier_id,'PURCHASE_RETURN',NEW.id,NEW.total_credit_centimes,0,current_balance_centimes-NEW.total_credit_centimes,'Purchase return '||NEW.return_number FROM suppliers WHERE id=NEW.supplier_id;
+END;
+
+
+-- Idempotency key is device-scoped, immutable, and can be finalized exactly once.
+CREATE TRIGGER trg_idempotency_device_scope BEFORE INSERT ON idempotency_records BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM registered_devices WHERE id=NEW.device_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'IDEMPOTENCY_DEVICE_TENANT_MISMATCH') END;
+ SELECT CASE WHEN NEW.request_hash IS NULL OR NEW.request_hash='' THEN RAISE(ABORT,'IDEMPOTENCY_REQUEST_HASH_REQUIRED') END;
+END;
+CREATE TRIGGER trg_idempotency_finalize_guard BEFORE UPDATE ON idempotency_records BEGIN
+ SELECT CASE WHEN NEW.tenant_id IS NOT OLD.tenant_id OR NEW.device_id IS NOT OLD.device_id OR NEW.client_request_id IS NOT OLD.client_request_id OR NEW.endpoint IS NOT OLD.endpoint OR NEW.request_hash IS NOT OLD.request_hash OR NEW.created_at IS NOT OLD.created_at THEN RAISE(ABORT,'IDEMPOTENCY_KEY_FIELDS_IMMUTABLE') END;
+ SELECT CASE WHEN OLD.status!='PROCESSING' OR NEW.status='PROCESSING' THEN RAISE(ABORT,'IDEMPOTENCY_FINALIZED_ONCE') END;
+END;
+CREATE TRIGGER trg_idempotency_no_delete BEFORE DELETE ON idempotency_records BEGIN SELECT RAISE(ABORT,'IDEMPOTENCY_RECORDS_RETAINED'); END;
+
+-- Document and adjustment immutability; drafts alone may be removed.
+CREATE TRIGGER trg_completed_purchase_no_delete BEFORE DELETE ON purchases WHEN OLD.status!='DRAFT' BEGIN SELECT RAISE(ABORT,'NON_DRAFT_PURCHASE_IMMUTABLE'); END;
+CREATE TRIGGER trg_completed_receipt_no_delete BEFORE DELETE ON purchase_receipts WHEN OLD.status='COMPLETED' BEGIN SELECT RAISE(ABORT,'COMPLETED_RECEIPT_IMMUTABLE'); END;
+CREATE TRIGGER trg_completed_receipt_no_update BEFORE UPDATE ON purchase_receipts WHEN OLD.status='COMPLETED' BEGIN SELECT RAISE(ABORT,'COMPLETED_RECEIPT_IMMUTABLE'); END;
+CREATE TRIGGER trg_adjustment_posted_no_delete BEFORE DELETE ON inventory_adjustments WHEN OLD.status='POSTED' BEGIN SELECT RAISE(ABORT,'POSTED_ADJUSTMENT_IMMUTABLE'); END;
+CREATE TRIGGER trg_adjustment_line_insert_draft BEFORE INSERT ON inventory_adjustment_lines WHEN (SELECT status FROM inventory_adjustments WHERE id=NEW.adjustment_id)!='DRAFT' BEGIN SELECT RAISE(ABORT,'ADJUSTMENT_LINES_ONLY_IN_DRAFT'); END;
+CREATE TRIGGER trg_adjustment_line_update_draft BEFORE UPDATE ON inventory_adjustment_lines WHEN (SELECT status FROM inventory_adjustments WHERE id=OLD.adjustment_id)!='DRAFT' BEGIN SELECT RAISE(ABORT,'ADJUSTMENT_LINES_ONLY_IN_DRAFT'); END;
+CREATE TRIGGER trg_adjustment_line_delete_draft BEFORE DELETE ON inventory_adjustment_lines WHEN (SELECT status FROM inventory_adjustments WHERE id=OLD.adjustment_id)!='DRAFT' BEGIN SELECT RAISE(ABORT,'ADJUSTMENT_LINES_ONLY_IN_DRAFT'); END;
+CREATE TRIGGER trg_audit_user_scope BEFORE INSERT ON audit_logs WHEN NEW.user_id IS NOT NULL BEGIN SELECT CASE WHEN (SELECT tenant_id FROM users WHERE id=NEW.user_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'AUDIT_USER_TENANT_MISMATCH') END; END;
+
+-- Purchase and sales document updates cannot mutate their posted identity/state.
+CREATE TRIGGER trg_completed_sale_no_core_update BEFORE UPDATE OF tenant_id,store_id,warehouse_id,customer_id,device_id,invoice_number,offline_receipt_number,local_operation_uuid,device_seq_num,device_signature,request_hash,batch_id,subtotal_centimes,discount_centimes,tax_centimes,total_amount_centimes,status ON sales WHEN OLD.status='COMPLETED' BEGIN SELECT RAISE(ABORT,'COMPLETED_SALE_CORE_IMMUTABLE'); END;
+CREATE TRIGGER trg_ordered_purchase_no_core_update BEFORE UPDATE OF tenant_id,supplier_id,store_id,order_number,total_amount_centimes ON purchases WHEN OLD.status!='DRAFT' BEGIN SELECT RAISE(ABORT,'ORDERED_PURCHASE_CORE_IMMUTABLE'); END;
+CREATE TRIGGER trg_purchase_item_update_draft BEFORE UPDATE ON purchase_items WHEN (SELECT status FROM purchases WHERE id=OLD.purchase_id)!='DRAFT' AND NEW.quantity_received_ticks=OLD.quantity_received_ticks AND NEW.quantity_returned_ticks=OLD.quantity_returned_ticks BEGIN SELECT RAISE(ABORT,'ORDERED_PURCHASE_ITEMS_IMMUTABLE'); END;
+CREATE TRIGGER trg_purchase_item_delete_draft BEFORE DELETE ON purchase_items WHEN (SELECT status FROM purchases WHERE id=OLD.purchase_id)!='DRAFT' BEGIN SELECT RAISE(ABORT,'ORDERED_PURCHASE_ITEMS_IMMUTABLE'); END;
+
+-- Schema version is kept in SQLite's native user_version, not a new business table.
+PRAGMA user_version=1;
+
+-- Final consistency guards: cached return/receipt counters must equal their source lines.
+CREATE TRIGGER trg_purchase_received_counter_consistency BEFORE UPDATE OF quantity_received_ticks ON purchase_items BEGIN
+ SELECT CASE WHEN NEW.quantity_received_ticks != COALESCE((SELECT SUM(pri.quantity_received_ticks) FROM purchase_receipt_items pri JOIN purchase_receipts pr ON pr.id=pri.receipt_id WHERE pri.purchase_item_id=OLD.id AND pr.status IN ('DRAFT','COMPLETED')),0) THEN RAISE(ABORT,'RECEIVED_COUNTER_MUST_MATCH_RECEIPT_LINES') END;
+END;
+CREATE TRIGGER trg_purchase_returned_counter_consistency BEFORE UPDATE OF quantity_returned_ticks ON purchase_items BEGIN
+ SELECT CASE WHEN NEW.quantity_returned_ticks != COALESCE((SELECT SUM(pri.returned_quantity_ticks) FROM purchase_return_items pri JOIN purchase_returns pr ON pr.id=pri.purchase_return_id WHERE pri.purchase_item_id=OLD.id AND pr.status IN ('DRAFT','COMPLETED')),0) THEN RAISE(ABORT,'PURCHASE_RETURN_COUNTER_MUST_MATCH_RETURN_LINES') END;
+END;
+CREATE TRIGGER trg_sale_returned_counter_consistency BEFORE UPDATE OF returned_quantity_ticks ON sale_items BEGIN
+ SELECT CASE WHEN NEW.returned_quantity_ticks != COALESCE((SELECT SUM(sri.returned_quantity_ticks) FROM sale_return_items sri JOIN sale_returns sr ON sr.id=sri.return_id WHERE sri.original_sale_item_id=OLD.id AND sr.status IN ('DRAFT','COMPLETED')),0) THEN RAISE(ABORT,'SALE_RETURN_COUNTER_MUST_MATCH_RETURN_LINES') END;
+END;
+
+-- Posted sale/purchase lines are immutable; all draft line changes preserve source counters.
+CREATE TRIGGER trg_sale_item_insert_draft BEFORE INSERT ON sale_items WHEN (SELECT status FROM sales WHERE id=NEW.sale_id)!='DRAFT' BEGIN SELECT RAISE(ABORT,'SALE_ITEMS_ONLY_IN_DRAFT'); END;
+CREATE TRIGGER trg_sale_item_update_draft BEFORE UPDATE ON sale_items WHEN (SELECT status FROM sales WHERE id=OLD.sale_id)!='DRAFT' BEGIN
+ SELECT CASE WHEN NEW.sale_id IS NOT OLD.sale_id OR NEW.stock_item_id IS NOT OLD.stock_item_id OR NEW.quantity_ticks IS NOT OLD.quantity_ticks OR NEW.unit_price_ticks IS NOT OLD.unit_price_ticks OR NEW.discount_bps IS NOT OLD.discount_bps OR NEW.tax_bps IS NOT OLD.tax_bps OR NEW.line_total_centimes IS NOT OLD.line_total_centimes OR NEW.cost_at_sale_ticks IS NOT OLD.cost_at_sale_ticks THEN RAISE(ABORT,'POSTED_SALE_ITEMS_IMMUTABLE') END;
+ SELECT CASE WHEN NEW.returned_quantity_ticks != COALESCE((SELECT SUM(sri.returned_quantity_ticks) FROM sale_return_items sri JOIN sale_returns sr ON sr.id=sri.return_id WHERE sri.original_sale_item_id=OLD.id AND sr.status IN ('DRAFT','COMPLETED')),0) THEN RAISE(ABORT,'SALE_RETURN_COUNTER_MUST_MATCH_RETURN_LINES') END;
+END;
+CREATE TRIGGER trg_sale_item_delete_draft BEFORE DELETE ON sale_items WHEN (SELECT status FROM sales WHERE id=OLD.sale_id)!='DRAFT' BEGIN SELECT RAISE(ABORT,'POSTED_SALE_ITEMS_IMMUTABLE'); END;
+CREATE TRIGGER trg_purchase_item_insert_draft BEFORE INSERT ON purchase_items WHEN (SELECT status FROM purchases WHERE id=NEW.purchase_id)!='DRAFT' BEGIN SELECT RAISE(ABORT,'PURCHASE_ITEMS_ONLY_IN_DRAFT'); END;
+CREATE TRIGGER trg_purchase_item_core_update_guard BEFORE UPDATE ON purchase_items WHEN (SELECT status FROM purchases WHERE id=OLD.purchase_id)!='DRAFT' BEGIN
+ SELECT CASE WHEN NEW.purchase_id IS NOT OLD.purchase_id OR NEW.stock_item_id IS NOT OLD.stock_item_id OR NEW.quantity_ordered_ticks IS NOT OLD.quantity_ordered_ticks OR NEW.unit_cost_ticks IS NOT OLD.unit_cost_ticks OR NEW.line_total_centimes IS NOT OLD.line_total_centimes THEN RAISE(ABORT,'ORDERED_PURCHASE_ITEMS_CORE_IMMUTABLE') END;
+ SELECT CASE WHEN NEW.quantity_received_ticks != COALESCE((SELECT SUM(pri.quantity_received_ticks) FROM purchase_receipt_items pri JOIN purchase_receipts pr ON pr.id=pri.receipt_id WHERE pri.purchase_item_id=OLD.id AND pr.status IN ('DRAFT','COMPLETED')),0) THEN RAISE(ABORT,'RECEIVED_COUNTER_MUST_MATCH_RECEIPT_LINES') END;
+ SELECT CASE WHEN NEW.quantity_returned_ticks != COALESCE((SELECT SUM(pri.returned_quantity_ticks) FROM purchase_return_items pri JOIN purchase_returns pr ON pr.id=pri.purchase_return_id WHERE pri.purchase_item_id=OLD.id AND pr.status IN ('DRAFT','COMPLETED')),0) THEN RAISE(ABORT,'PURCHASE_RETURN_COUNTER_MUST_MATCH_RETURN_LINES') END;
+END;
+
+
+-- Inventory adjustments are draft documents; posting creates immutable movements exactly once.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_adjustment_line_stock ON inventory_adjustment_lines(adjustment_id,stock_item_id);
+CREATE TRIGGER trg_adjustment_header_start_draft BEFORE INSERT ON inventory_adjustments WHEN NEW.status!='DRAFT' BEGIN SELECT RAISE(ABORT,'ADJUSTMENT_MUST_START_AS_DRAFT'); END;
+CREATE TRIGGER trg_adjustment_scope_insert BEFORE INSERT ON inventory_adjustments BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM warehouses WHERE id=NEW.warehouse_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'ADJUSTMENT_WAREHOUSE_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_adjustment_line_guard BEFORE INSERT ON inventory_adjustment_lines BEGIN
+ SELECT CASE WHEN (SELECT status FROM inventory_adjustments WHERE id=NEW.adjustment_id)!='DRAFT' THEN RAISE(ABORT,'ADJUSTMENT_LINES_ONLY_IN_DRAFT') END;
+ SELECT CASE WHEN NEW.system_quantity_ticks<0 OR NEW.actual_quantity_ticks<0 OR NEW.unit_cost_ticks<0 THEN RAISE(ABORT,'ADJUSTMENT_QUANTITIES_AND_COST_MUST_BE_NONNEGATIVE') END;
+ SELECT CASE WHEN NEW.difference_ticks != NEW.actual_quantity_ticks-NEW.system_quantity_ticks THEN RAISE(ABORT,'ADJUSTMENT_DIFFERENCE_MISMATCH') END;
+ SELECT CASE WHEN NEW.system_quantity_ticks != COALESCE((SELECT on_hand_ticks FROM inventory_balances WHERE warehouse_id=(SELECT warehouse_id FROM inventory_adjustments WHERE id=NEW.adjustment_id) AND stock_item_id=NEW.stock_item_id),0) THEN RAISE(ABORT,'ADJUSTMENT_SYSTEM_QUANTITY_STALE') END;
+ SELECT CASE WHEN NEW.actual_quantity_ticks < COALESCE((SELECT reserved_ticks FROM inventory_balances WHERE warehouse_id=(SELECT warehouse_id FROM inventory_adjustments WHERE id=NEW.adjustment_id) AND stock_item_id=NEW.stock_item_id),0) THEN RAISE(ABORT,'ADJUSTMENT_CANNOT_REDUCE_BELOW_RESERVED') END;
+ SELECT CASE WHEN (SELECT tenant_id FROM products p JOIN stock_items si ON si.product_id=p.id WHERE si.id=NEW.stock_item_id) IS NOT (SELECT tenant_id FROM inventory_adjustments WHERE id=NEW.adjustment_id) THEN RAISE(ABORT,'ADJUSTMENT_STOCK_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_adjustment_complete_guard BEFORE UPDATE OF status ON inventory_adjustments WHEN OLD.status='DRAFT' AND NEW.status='POSTED' BEGIN
+ SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM inventory_adjustment_lines WHERE adjustment_id=OLD.id) THEN RAISE(ABORT,'EMPTY_ADJUSTMENT_CANNOT_POST') END;
+END;
+CREATE TRIGGER trg_adjustment_complete_post AFTER UPDATE OF status ON inventory_adjustments WHEN OLD.status='DRAFT' AND NEW.status='POSTED' BEGIN
+ INSERT INTO inventory_movements(id,tenant_id,warehouse_id,stock_item_id,movement_type,source_event_id,reference_line_id,quantity_ticks,unit_cost_ticks,total_cost_centimes)
+ SELECT 'ADJ_IN_'||id,NEW.tenant_id,NEW.warehouse_id,stock_item_id,'ADJUSTMENT_IN','ADJUSTMENT:'||id,id,difference_ticks,unit_cost_ticks,CAST(difference_ticks*unit_cost_ticks/1000000 AS INTEGER)
+ FROM inventory_adjustment_lines WHERE adjustment_id=NEW.id AND difference_ticks>0;
+ INSERT INTO inventory_movements(id,tenant_id,warehouse_id,stock_item_id,movement_type,source_event_id,reference_line_id,quantity_ticks,unit_cost_ticks,total_cost_centimes)
+ SELECT 'ADJ_OUT_'||id,NEW.tenant_id,NEW.warehouse_id,stock_item_id,'ADJUSTMENT_OUT','ADJUSTMENT:'||id,id,0-difference_ticks,unit_cost_ticks,CAST((0-difference_ticks)*unit_cost_ticks/1000000 AS INTEGER)
+ FROM inventory_adjustment_lines WHERE adjustment_id=NEW.id AND difference_ticks<0;
+END;
+CREATE TRIGGER trg_adjustment_header_no_update BEFORE UPDATE ON inventory_adjustments WHEN OLD.status!='DRAFT' BEGIN SELECT RAISE(ABORT,'NON_DRAFT_ADJUSTMENT_IMMUTABLE'); END;
+CREATE TRIGGER trg_adjustment_header_fields_locked BEFORE UPDATE OF tenant_id,warehouse_id,adjustment_number,reason,created_at ON inventory_adjustments BEGIN SELECT RAISE(ABORT,'ADJUSTMENT_HEADER_FIELDS_IMMUTABLE'); END;
+CREATE TRIGGER trg_adjustment_header_no_delete BEFORE DELETE ON inventory_adjustments WHEN OLD.status!='DRAFT' BEGIN SELECT RAISE(ABORT,'NON_DRAFT_ADJUSTMENT_IMMUTABLE'); END;
+
+-- Price lists and groups cannot cross tenant boundaries on either insert or update.
+CREATE TRIGGER trg_price_list_item_tenant_insert BEFORE INSERT ON price_list_items BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM price_lists WHERE id=NEW.price_list_id) IS NOT (SELECT tenant_id FROM products WHERE id=NEW.product_id) THEN RAISE(ABORT,'PRICE_LIST_PRODUCT_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_price_list_item_tenant_update BEFORE UPDATE OF price_list_id,product_id ON price_list_items BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM price_lists WHERE id=NEW.price_list_id) IS NOT (SELECT tenant_id FROM products WHERE id=NEW.product_id) THEN RAISE(ABORT,'PRICE_LIST_PRODUCT_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_product_category_scope_update BEFORE UPDATE OF tenant_id,category_id ON products WHEN NEW.category_id IS NOT NULL BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM categories WHERE id=NEW.category_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'PRODUCT_CATEGORY_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_customer_group_scope_update BEFORE UPDATE OF tenant_id,group_id ON customers WHEN NEW.group_id IS NOT NULL BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM customer_groups WHERE id=NEW.group_id) IS NOT NEW.tenant_id THEN RAISE(ABORT,'CUSTOMER_GROUP_TENANT_MISMATCH') END;
+END;
+
+-- Completed/cancelled documents are immutable; no draft header can be repurposed.
+CREATE TRIGGER trg_purchase_receipt_status_transition BEFORE UPDATE OF status ON purchase_receipts BEGIN
+ SELECT CASE WHEN OLD.status!='DRAFT' OR NEW.status NOT IN ('COMPLETED','CANCELLED') THEN RAISE(ABORT,'INVALID_RECEIPT_STATUS_TRANSITION') END;
+END;
+CREATE TRIGGER trg_purchase_return_status_transition BEFORE UPDATE OF status ON purchase_returns BEGIN
+ SELECT CASE WHEN OLD.status!='DRAFT' OR NEW.status NOT IN ('COMPLETED','CANCELLED') THEN RAISE(ABORT,'INVALID_PURCHASE_RETURN_STATUS_TRANSITION') END;
+END;
+CREATE TRIGGER trg_sale_return_status_transition BEFORE UPDATE OF status ON sale_returns BEGIN
+ SELECT CASE WHEN OLD.status!='DRAFT' OR NEW.status NOT IN ('COMPLETED','CANCELLED') THEN RAISE(ABORT,'INVALID_SALE_RETURN_STATUS_TRANSITION') END;
+END;
+
+-- Final document validation: totals, remaining refundable value, shift scope, and source integrity.
+CREATE TRIGGER trg_sale_financial_totals_guard BEFORE UPDATE OF status ON sales WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' BEGIN
+ SELECT CASE WHEN NEW.subtotal_centimes-NEW.discount_centimes+NEW.tax_centimes!=NEW.total_amount_centimes THEN RAISE(ABORT,'SALE_HEADER_TOTAL_MISMATCH') END;
+END;
+CREATE TRIGGER trg_purchase_order_totals_guard BEFORE UPDATE OF status ON purchases WHEN OLD.status='DRAFT' AND NEW.status='ORDERED' BEGIN
+ SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM purchase_items WHERE purchase_id=OLD.id) THEN RAISE(ABORT,'PURCHASE_REQUIRES_ITEMS') END;
+ SELECT CASE WHEN (SELECT COALESCE(SUM(line_total_centimes),0) FROM purchase_items WHERE purchase_id=OLD.id)!=NEW.total_amount_centimes THEN RAISE(ABORT,'PURCHASE_HEADER_TOTAL_MISMATCH') END;
+END;
+CREATE TRIGGER trg_purchase_return_value_guard BEFORE UPDATE OF status ON purchase_returns WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' BEGIN
+ SELECT CASE WHEN NEW.total_credit_centimes+COALESCE((SELECT SUM(total_credit_centimes) FROM purchase_returns WHERE purchase_id=NEW.purchase_id AND status='COMPLETED'),0)>(SELECT total_amount_centimes FROM purchases WHERE id=NEW.purchase_id) THEN RAISE(ABORT,'PURCHASE_RETURN_VALUE_EXCEEDS_PURCHASE_TOTAL') END;
+END;
+CREATE TRIGGER trg_sale_return_value_guard BEFORE UPDATE OF status ON sale_returns WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' BEGIN
+ SELECT CASE WHEN NEW.total_refund_centimes+COALESCE((SELECT SUM(total_refund_centimes) FROM sale_returns WHERE original_sale_id=NEW.original_sale_id AND status='COMPLETED'),0)>(SELECT total_amount_centimes FROM sales WHERE id=NEW.original_sale_id) THEN RAISE(ABORT,'SALE_RETURN_VALUE_EXCEEDS_SALE_TOTAL') END;
+ SELECT CASE WHEN NEW.refund_status='CREDITED_TO_ACCOUNT' AND NEW.customer_id IS NULL THEN RAISE(ABORT,'ACCOUNT_CREDIT_REFUND_REQUIRES_CUSTOMER') END;
+ SELECT CASE WHEN NEW.refund_status='REFUNDED_CASH' AND (SELECT cr.store_id FROM cash_shifts cs JOIN cash_registers cr ON cr.id=cs.cash_register_id WHERE cs.id=NEW.shift_id) IS NOT NEW.store_id THEN RAISE(ABORT,'SALE_RETURN_CASH_SHIFT_STORE_MISMATCH') END;
+END;
+CREATE TRIGGER trg_sale_return_item_value_active BEFORE INSERT ON sale_return_items BEGIN
+ SELECT CASE WHEN NEW.line_total_centimes+COALESCE((SELECT SUM(sri.line_total_centimes) FROM sale_return_items sri JOIN sale_returns sr ON sr.id=sri.return_id WHERE sri.original_sale_item_id=NEW.original_sale_item_id AND sr.status IN ('DRAFT','COMPLETED')),0)>(SELECT line_total_centimes FROM sale_items WHERE id=NEW.original_sale_item_id) THEN RAISE(ABORT,'ACTIVE_SALE_RETURN_VALUE_EXCEEDS_SOURCE_LINE') END;
+END;
+
+-- Cash sessions and expenses are historical financial records.
+CREATE TRIGGER trg_cash_shift_insert_open_only BEFORE INSERT ON cash_shifts WHEN NEW.status!='OPEN' BEGIN SELECT RAISE(ABORT,'CASH_SHIFT_MUST_START_OPEN'); END;
+CREATE TRIGGER trg_cash_shift_scope_insert BEFORE INSERT ON cash_shifts BEGIN
+ SELECT CASE WHEN (SELECT tenant_id FROM users WHERE id=NEW.user_id) IS NOT (SELECT tenant_id FROM cash_registers WHERE id=NEW.cash_register_id) THEN RAISE(ABORT,'CASH_SHIFT_USER_REGISTER_TENANT_MISMATCH') END;
+END;
+CREATE TRIGGER trg_cash_shift_closed_immutable BEFORE UPDATE ON cash_shifts WHEN OLD.status='CLOSED' BEGIN SELECT RAISE(ABORT,'CLOSED_CASH_SHIFT_IMMUTABLE'); END;
+CREATE TRIGGER trg_expense_immutable_update BEFORE UPDATE ON expenses BEGIN SELECT RAISE(ABORT,'EXPENSE_RECORDS_ARE_IMMUTABLE_USE_REVERSAL'); END;
+CREATE TRIGGER trg_expense_immutable_delete BEFORE DELETE ON expenses BEGIN SELECT RAISE(ABORT,'EXPENSE_RECORDS_ARE_IMMUTABLE'); END;
+
+-- A draft allocation can be corrected only before its payment is posted.
+CREATE TRIGGER trg_allocation_update_draft_guard BEFORE UPDATE ON payment_allocations WHEN (SELECT status FROM payments WHERE id=OLD.payment_id)!='DRAFT' BEGIN SELECT RAISE(ABORT,'POSTED_PAYMENT_ALLOCATIONS_IMMUTABLE'); END;
+CREATE TRIGGER trg_allocation_delete_draft_guard BEFORE DELETE ON payment_allocations WHEN (SELECT status FROM payments WHERE id=OLD.payment_id)!='DRAFT' BEGIN SELECT RAISE(ABORT,'POSTED_PAYMENT_ALLOCATIONS_IMMUTABLE'); END;
+DROP TRIGGER IF EXISTS trg_allocation_no_update;
+DROP TRIGGER IF EXISTS trg_allocation_no_delete;
+
+-- Ledger events must refer to the correct posted source document and party.
+CREATE TRIGGER trg_ledger_source_document_guard BEFORE INSERT ON party_ledger_entries BEGIN
+ SELECT CASE WHEN NEW.source_document_type='SALE' AND NOT EXISTS(SELECT 1 FROM sales s WHERE s.id=NEW.source_document_id AND s.status='COMPLETED' AND s.tenant_id=NEW.tenant_id AND s.customer_id=NEW.party_id AND NEW.party_type='CUSTOMER') THEN RAISE(ABORT,'LEDGER_SALE_SOURCE_MISMATCH') END;
+ SELECT CASE WHEN NEW.source_document_type='PURCHASE' AND NOT EXISTS(SELECT 1 FROM purchases p WHERE p.id=NEW.source_document_id AND p.status IN ('ORDERED','RECEIVED') AND p.tenant_id=NEW.tenant_id AND p.supplier_id=NEW.party_id AND NEW.party_type='SUPPLIER') THEN RAISE(ABORT,'LEDGER_PURCHASE_SOURCE_MISMATCH') END;
+ SELECT CASE WHEN NEW.source_document_type='PAYMENT' AND NOT EXISTS(SELECT 1 FROM payments p WHERE p.id=NEW.source_document_id AND p.status='POSTED' AND p.tenant_id=NEW.tenant_id AND p.party_id=NEW.party_id AND p.party_type=NEW.party_type) THEN RAISE(ABORT,'LEDGER_PAYMENT_SOURCE_MISMATCH') END;
+ SELECT CASE WHEN NEW.source_document_type='SALE_RETURN' AND NOT EXISTS(SELECT 1 FROM sale_returns r WHERE r.id=NEW.source_document_id AND r.status='COMPLETED' AND r.tenant_id=NEW.tenant_id AND r.customer_id=NEW.party_id AND NEW.party_type='CUSTOMER') THEN RAISE(ABORT,'LEDGER_SALE_RETURN_SOURCE_MISMATCH') END;
+ SELECT CASE WHEN NEW.source_document_type='PURCHASE_RETURN' AND NOT EXISTS(SELECT 1 FROM purchase_returns r WHERE r.id=NEW.source_document_id AND r.status='COMPLETED' AND r.tenant_id=NEW.tenant_id AND r.supplier_id=NEW.party_id AND NEW.party_type='SUPPLIER') THEN RAISE(ABORT,'LEDGER_PURCHASE_RETURN_SOURCE_MISMATCH') END;
+END;
+CREATE TRIGGER trg_adjustment_post_snapshot_guard BEFORE UPDATE OF status ON inventory_adjustments WHEN OLD.status='DRAFT' AND NEW.status='POSTED' BEGIN
+ SELECT CASE WHEN EXISTS(SELECT 1 FROM inventory_adjustment_lines l WHERE l.adjustment_id=OLD.id AND l.system_quantity_ticks!=COALESCE((SELECT on_hand_ticks FROM inventory_balances b WHERE b.warehouse_id=OLD.warehouse_id AND b.stock_item_id=l.stock_item_id),0)) THEN RAISE(ABORT,'ADJUSTMENT_STOCK_CHANGED_AFTER_COUNT') END;
+ SELECT CASE WHEN EXISTS(SELECT 1 FROM inventory_adjustment_lines l WHERE l.adjustment_id=OLD.id AND l.actual_quantity_ticks<COALESCE((SELECT reserved_ticks FROM inventory_balances b WHERE b.warehouse_id=OLD.warehouse_id AND b.stock_item_id=l.stock_item_id),0)) THEN RAISE(ABORT,'ADJUSTMENT_ACTUAL_BELOW_RESERVED') END;
+END;
+
+-- Exact fixed-point arithmetic: movement value and purchase/return line costs must reconcile.
+CREATE TRIGGER trg_movement_total_cost_guard BEFORE INSERT ON inventory_movements BEGIN
+ SELECT CASE WHEN NEW.total_cost_centimes!=CAST(NEW.quantity_ticks*NEW.unit_cost_ticks/1000000 AS INTEGER) THEN RAISE(ABORT,'MOVEMENT_TOTAL_COST_MISMATCH') END;
+END;
+CREATE TRIGGER trg_purchase_item_cost_guard BEFORE INSERT ON purchase_items BEGIN
+ SELECT CASE WHEN NEW.line_total_centimes!=CAST(NEW.quantity_ordered_ticks*NEW.unit_cost_ticks/1000000 AS INTEGER) THEN RAISE(ABORT,'PURCHASE_LINE_TOTAL_MISMATCH') END;
+END;
+CREATE TRIGGER trg_purchase_item_cost_update_guard BEFORE UPDATE OF quantity_ordered_ticks,unit_cost_ticks,line_total_centimes ON purchase_items BEGIN
+ SELECT CASE WHEN NEW.line_total_centimes!=CAST(NEW.quantity_ordered_ticks*NEW.unit_cost_ticks/1000000 AS INTEGER) THEN RAISE(ABORT,'PURCHASE_LINE_TOTAL_MISMATCH') END;
+END;
+CREATE TRIGGER trg_purchase_return_item_cost_guard BEFORE INSERT ON purchase_return_items BEGIN
+ SELECT CASE WHEN NEW.line_total_centimes!=CAST(NEW.returned_quantity_ticks*NEW.unit_cost_ticks/1000000 AS INTEGER) THEN RAISE(ABORT,'PURCHASE_RETURN_LINE_TOTAL_MISMATCH') END;
+END;
+CREATE TRIGGER trg_sale_return_item_cost_guard BEFORE INSERT ON sale_return_items BEGIN
+ SELECT CASE WHEN NEW.line_total_centimes!=CAST(NEW.returned_quantity_ticks*NEW.refund_unit_price_ticks/1000000 AS INTEGER) THEN RAISE(ABORT,'SALE_RETURN_LINE_TOTAL_MISMATCH') END;
+END;
+
+-- Draft sale cancellation releases any offline reservations without posting inventory.
+CREATE TRIGGER trg_cancel_draft_sale_release_quota BEFORE UPDATE OF status ON sales WHEN OLD.status='DRAFT' AND NEW.status='CANCELLED' BEGIN
+ DELETE FROM sale_item_quota_deductions WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id=OLD.id);
+END;
+CREATE TRIGGER trg_purchase_status_transition_guard BEFORE UPDATE OF status ON purchases BEGIN
+ SELECT CASE WHEN OLD.status='DRAFT' AND NEW.status NOT IN ('ORDERED','CANCELLED') THEN RAISE(ABORT,'INVALID_PURCHASE_STATUS_TRANSITION') END;
+ SELECT CASE WHEN OLD.status IN ('ORDERED','RECEIVED') AND NEW.status!=OLD.status AND NEW.status!='RECEIVED' THEN RAISE(ABORT,'ORDERED_PURCHASE_CANNOT_BE_CANCELLED_OR_REOPENED') END;
+END;
+
+-- Protect quota identity and maintain exact consumed-counter reconciliation.
+CREATE TRIGGER trg_quota_fields_immutable BEFORE UPDATE OF tenant_id,device_id,warehouse_id,stock_item_id,quota_quantity_ticks,valid_until,signed_token,created_at ON inventory_quotas BEGIN SELECT RAISE(ABORT,'QUOTA_IDENTITY_AND_SIGNED_PAYLOAD_IMMUTABLE'); END;
+CREATE TRIGGER trg_quota_consumed_counter_guard BEFORE UPDATE OF consumed_quantity_ticks ON inventory_quotas BEGIN
+ SELECT CASE WHEN NEW.consumed_quantity_ticks!=COALESCE((SELECT SUM(deducted_quantity_ticks) FROM sale_item_quota_deductions WHERE quota_id=OLD.id),0) THEN RAISE(ABORT,'QUOTA_CONSUMED_COUNTER_MUST_MATCH_DEDUCTIONS') END;
+END;
+CREATE TRIGGER trg_quota_status_transition_guard BEFORE UPDATE OF status ON inventory_quotas BEGIN
+ SELECT CASE WHEN OLD.status NOT IN ('ACTIVE','LOST_DEVICE_EXPOSURE') OR NEW.status NOT IN ('RECONCILED','EXPIRED','VOIDED_BY_ADMIN','LOST_DEVICE_EXPOSURE') OR NEW.status=OLD.status THEN RAISE(ABORT,'INVALID_QUOTA_STATUS_TRANSITION') END;
+END;
+CREATE TRIGGER trg_device_sequence_guard BEFORE UPDATE OF last_seq_num ON registered_devices WHEN NEW.last_seq_num!=OLD.last_seq_num BEGIN
+ SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM sales s WHERE s.device_id=OLD.id AND s.device_seq_num=NEW.last_seq_num AND s.status='COMPLETED') THEN RAISE(ABORT,'DEVICE_SEQUENCE_MUST_MATCH_COMPLETED_SALE') END;
+END;
+CREATE TRIGGER trg_device_public_key_immutable BEFORE UPDATE OF public_key,tenant_id,store_id ON registered_devices BEGIN SELECT RAISE(ABORT,'DEVICE_IDENTITY_AND_PUBLIC_KEY_IMMUTABLE'); END;
+
+-- Idempotency records may be purged only after the documented retention window.
+DROP TRIGGER IF EXISTS trg_idempotency_no_delete;
+CREATE TRIGGER trg_idempotency_no_delete BEFORE DELETE ON idempotency_records BEGIN
+ SELECT CASE WHEN OLD.status='PROCESSING' OR OLD.created_at>=strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days') THEN RAISE(ABORT,'IDEMPOTENCY_RECORD_WITHIN_RETENTION_WINDOW') END;
+END;
+CREATE TRIGGER trg_sale_invoice_required_guard BEFORE UPDATE OF status ON sales WHEN OLD.status='DRAFT' AND NEW.status='COMPLETED' BEGIN
+ SELECT CASE WHEN NEW.invoice_number IS NULL OR NEW.invoice_number='' THEN RAISE(ABORT,'COMPLETED_SALE_REQUIRES_HOST_INVOICE_NUMBER') END;
+END;

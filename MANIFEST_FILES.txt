@@ -1,0 +1,24 @@
+# Store Manager Pro — Phase 1B Manifest of Files
+
+### Added Files:
+- shared/data/src/commonMain/kotlin/com/storemanager/core/data/DatabaseExceptions.kt
+- shared/data/src/androidUnitTest/kotlin/com/storemanager/core/data/AndroidDatabaseIsolationTest.kt
+- app/src/test/java/com/storemanager/pos/AndroidIsolationRobolectricTest.kt
+- gradlew
+- gradlew.bat
+- gradle/wrapper/gradle-wrapper.jar
+- PHASE_1B_FINAL_VERIFICATION_REPORT.md
+- PHASE_1B_CHANGELOG.md
+- build_and_test_full.log
+- MANIFEST_FILES.txt
+
+### Modified Files:
+- shared/data/src/desktopMain/kotlin/com/storemanager/core/data/DatabaseDriverFactory.desktop.kt (implemented staging atomicity, validation, connection PRAGMAs)
+- shared/data/src/commonMain/kotlin/com/storemanager/core/data/StoreDatabaseManager.kt (added driver access and state query)
+- shared/data/src/desktopTest/kotlin/com/storemanager/core/data/StoreDatabaseIntegrationTest.kt (expanded to 26 tests covering all edge cases)
+- app/build.gradle.kts (added testImplementation on shared:data)
+- FINAL_CLOSURE_REPORT.md (added reference banner pointing to PHASE_1B_FINAL_VERIFICATION_REPORT.md)
+
+### Removed / Cleaned Files:
+- Duplicate template webp mipmap launcher icons in app/src/main/res/mipmap-*/ic_launcher*.webp
+- Unused boilerplate template package app/src/main/java/com/example/
